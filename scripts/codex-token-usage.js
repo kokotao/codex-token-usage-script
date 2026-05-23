@@ -5,13 +5,17 @@
   const BADGE_CLASS = "codex-token-usage-badge";
   const STYLE_ID = "codex-token-usage-style";
   const RECENT_LIMIT = 20;
+  const CONTEXT_POLL_INTERVAL_MS = 1000;
 
   if (window.__codexTokenUsageScriptInstalled) return;
   window.__codexTokenUsageScriptInstalled = true;
 
   const state = {
     lastMetric: null,
+    lastMetricKey: "",
     recent: [],
+    turnStartedAt: 0,
+    contextPollTimer: 0,
   };
 
   function normalizeNumber(value) {
@@ -21,17 +25,35 @@
 
   function normalizeUsage(raw) {
     if (!raw || typeof raw !== "object") return null;
-    const inputTokens = normalizeNumber(raw.input_tokens ?? raw.prompt_tokens);
-    const outputTokens = normalizeNumber(raw.output_tokens ?? raw.completion_tokens);
-    const totalTokens = normalizeNumber(raw.total_tokens || inputTokens + outputTokens);
+    const inputTokens = normalizeNumber(raw.input_tokens ?? raw.inputTokens ?? raw.prompt_tokens ?? raw.promptTokens);
+    const outputTokens = normalizeNumber(
+      raw.output_tokens ?? raw.outputTokens ?? raw.completion_tokens ?? raw.completionTokens,
+    );
+    const totalTokens = normalizeNumber(
+      raw.total_tokens ?? raw.totalTokens ?? raw.usedTokens ?? raw.used_tokens ?? raw.used ?? inputTokens + outputTokens,
+    );
     const cachedTokens = normalizeNumber(
       raw.cached_tokens ??
+        raw.cachedTokens ??
+        raw.cached_input_tokens ??
+        raw.cachedInputTokens ??
         raw.prompt_tokens_details?.cached_tokens ??
-        raw.input_tokens_details?.cached_tokens,
+        raw.promptTokensDetails?.cachedTokens ??
+        raw.input_tokens_details?.cached_tokens ??
+        raw.inputTokensDetails?.cachedTokens,
     );
-    const cacheReadTokens = normalizeNumber(raw.cache_read_input_tokens);
-    const cacheCreationTokens = normalizeNumber(raw.cache_creation_input_tokens);
-    if (!inputTokens && !outputTokens && !totalTokens && !cachedTokens && !cacheReadTokens && !cacheCreationTokens) {
+    const cacheReadTokens = normalizeNumber(raw.cache_read_input_tokens ?? raw.cacheReadInputTokens);
+    const cacheCreationTokens = normalizeNumber(raw.cache_creation_input_tokens ?? raw.cacheCreationInputTokens);
+    const contextLimit = normalizeNumber(raw.modelContextWindow ?? raw.model_context_window ?? raw.contextWindow ?? raw.context_window ?? raw.limit);
+    if (
+      !inputTokens &&
+      !outputTokens &&
+      !totalTokens &&
+      !cachedTokens &&
+      !cacheReadTokens &&
+      !cacheCreationTokens &&
+      !contextLimit
+    ) {
       return null;
     }
     return {
@@ -41,6 +63,9 @@
       cachedTokens,
       cacheReadTokens,
       cacheCreationTokens,
+      hasBreakdown: !!(inputTokens || outputTokens || cachedTokens || cacheReadTokens || cacheCreationTokens),
+      contextUsed: totalTokens,
+      contextLimit,
     };
   }
 
@@ -55,13 +80,38 @@
     }
     if (typeof value !== "object") return null;
 
-    const direct = normalizeUsage(value.usage);
-    if (direct) return direct;
+    const tokenStatus = value.last || value.lastUsage || value.lastTokenUsage || value.last_token_usage;
+    if (tokenStatus && (value.modelContextWindow || value.model_context_window || value.contextWindow || value.context_window)) {
+      const statusUsage = normalizeUsage({
+        ...tokenStatus,
+        modelContextWindow: value.modelContextWindow ?? value.model_context_window,
+        contextWindow: value.contextWindow ?? value.context_window,
+      });
+      if (statusUsage) return statusUsage;
+    }
+
+    for (const key of ["usage", "last", "lastUsage", "lastTokenUsage", "last_token_usage"]) {
+      const direct = normalizeUsage(value[key]);
+      if (direct) return direct;
+    }
 
     const self = normalizeUsage(value);
     if (self) return self;
 
-    for (const key of ["response", "data", "body", "message", "result", "event"]) {
+    for (const key of [
+      "response",
+      "data",
+      "body",
+      "message",
+      "result",
+      "event",
+      "params",
+      "tokenUsage",
+      "token_usage",
+      "contextUsage",
+      "context_usage",
+      "info",
+    ]) {
       const usage = findUsageInObject(value[key], depth + 1);
       if (usage) return usage;
     }
@@ -113,13 +163,17 @@
     if (usage.cachedTokens) cacheParts.push(`缓存 ${formatNumber(usage.cachedTokens)}`);
     if (usage.cacheReadTokens) cacheParts.push(`缓存读 ${formatNumber(usage.cacheReadTokens)}`);
     if (usage.cacheCreationTokens) cacheParts.push(`缓存写 ${formatNumber(usage.cacheCreationTokens)}`);
-    return [
-      `Tokens ${formatNumber(usage.totalTokens)}`,
-      `输入 ${formatNumber(usage.inputTokens)}`,
-      `输出 ${formatNumber(usage.outputTokens)}`,
-      ...cacheParts,
-      `耗时 ${formatSeconds(metric?.elapsedMs)}`,
-    ].join(" · ");
+    const parts = [`Tokens ${formatNumber(usage.totalTokens)}`];
+    if (usage.hasBreakdown || usage.inputTokens || usage.outputTokens) {
+      parts.push(`输入 ${formatNumber(usage.inputTokens)}`, `输出 ${formatNumber(usage.outputTokens)}`, ...cacheParts);
+    } else {
+      parts.push("输入 -", "输出 -");
+    }
+    if (usage.contextLimit) {
+      parts.push(`上下文 ${formatNumber(usage.contextUsed || usage.totalTokens)}/${formatNumber(usage.contextLimit)}`);
+    }
+    parts.push(`耗时 ${Number.isFinite(metric?.elapsedMs) && metric.elapsedMs > 0 ? formatSeconds(metric.elapsedMs) : "-"}`);
+    return parts.join(" · ");
   }
 
   function nowMs() {
@@ -137,8 +191,37 @@
     return String(input || "");
   }
 
+  function metricKey(metric) {
+    const usage = metric?.usage || {};
+    return [
+      metric?.conversationId || "",
+      metric?.source || "",
+      usage.totalTokens || 0,
+      usage.inputTokens || 0,
+      usage.outputTokens || 0,
+      usage.cachedTokens || 0,
+      usage.cacheReadTokens || 0,
+      usage.cacheCreationTokens || 0,
+      usage.contextLimit || 0,
+    ].join(":");
+  }
+
+  function markTurnStarted(started = nowMs()) {
+    state.turnStartedAt = started;
+  }
+
+  function elapsedSinceTurnStarted() {
+    return state.turnStartedAt ? nowMs() - state.turnStartedAt : 0;
+  }
+
   function rememberMetric(metric) {
     if (!metric?.usage) return;
+    const nextKey = metricKey(metric);
+    if (nextKey && nextKey === state.lastMetricKey) {
+      scheduleRender();
+      return;
+    }
+    state.lastMetricKey = nextKey;
     state.lastMetric = {
       ...metric,
       id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
@@ -155,7 +238,20 @@
 
   function parseResponseText(text, elapsedMs, url) {
     const usage = extractUsage(text);
-    if (usage) rememberMetric({ usage, elapsedMs, url });
+    if (usage) rememberMetric({ usage, elapsedMs, url, source: "network" });
+  }
+
+  function inspectPayload(payload, source, conversationId) {
+    const usage = extractUsage(payload);
+    if (usage) {
+      rememberMetric({ usage, elapsedMs: elapsedSinceTurnStarted(), source, conversationId });
+      return true;
+    }
+    return false;
+  }
+
+  function inspectPayloadText(text, source, conversationId) {
+    return inspectPayload(text, source, conversationId);
   }
 
   function installFetchObserver() {
@@ -164,6 +260,7 @@
     function wrappedFetch(input, init) {
       const url = requestUrl(input);
       const started = nowMs();
+      if (isCodexApiUrl(url)) markTurnStarted(started);
       return originalFetch(input, init).then((response) => {
         if (isCodexApiUrl(url) && response?.clone) {
           response
@@ -190,6 +287,7 @@
     };
     Xhr.prototype.send = function send(...args) {
       const started = nowMs();
+      if (isCodexApiUrl(this.__codexTokenUsageUrl)) markTurnStarted(started);
       this.addEventListener?.("loadend", () => {
         const url = this.__codexTokenUsageUrl;
         if (!isCodexApiUrl(url)) return;
@@ -202,6 +300,156 @@
       return originalSend.apply(this, args);
     };
     Xhr.prototype.__codexTokenUsageWrapped = true;
+  }
+
+  function installPostMessageObserver() {
+    if (window.__codexTokenUsageMessageObserver) return;
+    window.addEventListener?.(
+      "message",
+      (event) => {
+        try {
+          inspectPayload(event.data, "post-message");
+        } catch (_) {
+          // Ignore unrelated window messages.
+        }
+      },
+      true,
+    );
+    window.__codexTokenUsageMessageObserver = true;
+  }
+
+  function installWebSocketObserver() {
+    if (typeof window.WebSocket !== "function" || window.__codexTokenUsageWebSocketWrapped) return;
+    const NativeWebSocket = window.WebSocket;
+
+    function TokenUsageWebSocket(...args) {
+      const socket = new NativeWebSocket(...args);
+      socket.addEventListener?.("message", (event) => {
+        try {
+          if (typeof event.data === "string") {
+            inspectPayloadText(event.data, "websocket");
+          } else if (event.data instanceof Blob && event.data.size <= 512000) {
+            event.data.text().then((text) => inspectPayloadText(text, "websocket")).catch(() => {});
+          }
+        } catch (_) {
+          // Keep socket delivery untouched.
+        }
+      });
+      return socket;
+    }
+
+    try {
+      TokenUsageWebSocket.prototype = NativeWebSocket.prototype;
+      Object.defineProperty(TokenUsageWebSocket, "CONNECTING", { value: NativeWebSocket.CONNECTING });
+      Object.defineProperty(TokenUsageWebSocket, "OPEN", { value: NativeWebSocket.OPEN });
+      Object.defineProperty(TokenUsageWebSocket, "CLOSING", { value: NativeWebSocket.CLOSING });
+      Object.defineProperty(TokenUsageWebSocket, "CLOSED", { value: NativeWebSocket.CLOSED });
+    } catch (_) {
+      // Constants are best-effort compatibility helpers.
+    }
+
+    window.WebSocket = TokenUsageWebSocket;
+    window.__codexTokenUsageWebSocketWrapped = true;
+  }
+
+  function normalizeContextReading(reading) {
+    if (!reading || typeof reading !== "object") return null;
+    const used = normalizeNumber(reading.used ?? reading.usedTokens ?? reading.used_tokens);
+    const limit = normalizeNumber(reading.limit ?? reading.contextWindow ?? reading.context_window);
+    if (!used && !limit) return null;
+    return {
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: used,
+        cachedTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        hasBreakdown: false,
+        contextUsed: used,
+        contextLimit: limit,
+      },
+      elapsedMs: elapsedSinceTurnStarted(),
+      source: reading.source || "context-meter",
+      conversationId: reading.conversationId || "",
+    };
+  }
+
+  function rememberContextReading(reading) {
+    const metric = normalizeContextReading(reading);
+    if (metric) rememberMetric(metric);
+  }
+
+  function readContextMeterMetric() {
+    try {
+      const meterState = window.__codexContextMeter?.getState?.();
+      rememberContextReading(meterState?.lastReading);
+    } catch (_) {
+      // Ignore unavailable or changing third-party script state.
+    }
+  }
+
+  function installContextMeterObserver() {
+    const captureState = window.__codexContextMeterCaptureState;
+    if (captureState && !captureState.__codexTokenUsageWrapped) {
+      const originalInspectText = captureState.inspectText;
+      if (typeof originalInspectText === "function") {
+        captureState.inspectText = function codexTokenUsageInspectText(text, source, conversationId) {
+          const started = elapsedSinceTurnStarted();
+          try {
+            const usage = extractUsage(text);
+            if (usage) rememberMetric({ usage, elapsedMs: started, source: source || "context-capture", conversationId });
+          } catch (_) {
+            // Keep the upstream context meter path intact.
+          }
+          return originalInspectText.apply(this, arguments);
+        };
+      }
+
+      const originalInspectValue = captureState.inspectValue;
+      if (typeof originalInspectValue === "function") {
+        captureState.inspectValue = function codexTokenUsageInspectValue(value, source, conversationId) {
+          let reading = null;
+          try {
+            const usage = extractUsage(value);
+            if (usage) rememberMetric({ usage, elapsedMs: elapsedSinceTurnStarted(), source: source || "context-value", conversationId });
+          } catch (_) {
+            // Continue to the original inspector.
+          }
+          reading = originalInspectValue.apply(this, arguments);
+          rememberContextReading(reading);
+          return reading;
+        };
+      }
+      captureState.__codexTokenUsageWrapped = true;
+    }
+
+    readContextMeterMetric();
+    if (!state.contextPollTimer) {
+      state.contextPollTimer = window.setInterval?.(() => {
+        installContextMeterObserver();
+        readContextMeterMetric();
+      }, CONTEXT_POLL_INTERVAL_MS);
+    }
+  }
+
+  function installTurnActivityObserver() {
+    if (window.__codexTokenUsageActivityObserver) return;
+    const markFromEvent = (event) => {
+      const target = event.target;
+      const text = `${target?.tagName || ""} ${target?.ariaLabel || ""} ${target?.textContent || ""}`;
+      if (
+        event.type === "submit" ||
+        (event.type === "keydown" && event.key === "Enter" && !event.shiftKey) ||
+        /send|submit|发送|提交/i.test(text)
+      ) {
+        markTurnStarted();
+      }
+    };
+    ["click", "submit", "keydown"].forEach((type) => {
+      document.addEventListener?.(type, markFromEvent, true);
+    });
+    window.__codexTokenUsageActivityObserver = true;
   }
 
   function ensureStyle() {
@@ -283,6 +531,10 @@
 
   installFetchObserver();
   installXhrObserver();
+  installPostMessageObserver();
+  installWebSocketObserver();
+  installContextMeterObserver();
+  installTurnActivityObserver();
   installDomObserver();
 
   if (window.__CODEX_TOKEN_USAGE_SCRIPT_TEST__) {
@@ -290,6 +542,7 @@
       extractUsage,
       formatBadgeText,
       normalizeUsage,
+      normalizeContextReading,
     };
   }
 })();

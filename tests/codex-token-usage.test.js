@@ -13,6 +13,10 @@ function loadHelpers() {
     console,
     setTimeout,
     clearTimeout,
+    setInterval() {
+      return 1;
+    },
+    clearInterval() {},
     document: {
       readyState: "complete",
       createElement() {
@@ -55,6 +59,8 @@ function loadHelpers() {
   sandbox.window.MutationObserver = sandbox.MutationObserver;
   sandbox.window.setTimeout = setTimeout;
   sandbox.window.clearTimeout = clearTimeout;
+  sandbox.window.setInterval = sandbox.setInterval;
+  sandbox.window.clearInterval = sandbox.clearInterval;
   sandbox.window.console = console;
   vm.createContext(sandbox);
   vm.runInContext(source, sandbox);
@@ -81,6 +87,9 @@ test("extractUsage finds Responses API usage from JSON", () => {
     cachedTokens: 800,
     cacheReadTokens: 0,
     cacheCreationTokens: 0,
+    hasBreakdown: true,
+    contextUsed: 1545,
+    contextLimit: 0,
   });
 });
 
@@ -100,6 +109,57 @@ test("extractUsage finds usage from SSE text", () => {
   assert.equal(usage.cacheReadTokens, 4);
 });
 
+test("extractUsage finds Codex latestTokenUsageInfo shape", () => {
+  const helpers = loadHelpers();
+  const usage = helpers.extractUsage({
+    modelContextWindow: 258400,
+    lastTokenUsage: {
+      inputTokens: 3200,
+      outputTokens: 900,
+      totalTokens: 4100,
+      cachedInputTokens: 1200,
+    },
+  });
+
+  assert.equal(usage.inputTokens, 3200);
+  assert.equal(usage.outputTokens, 900);
+  assert.equal(usage.totalTokens, 4100);
+  assert.equal(usage.cachedTokens, 1200);
+  assert.equal(usage.contextLimit, 258400);
+});
+
+test("extractUsage finds token_count event shape", () => {
+  const helpers = loadHelpers();
+  const usage = helpers.extractUsage({
+    type: "token_count",
+    info: {
+      model_context_window: 200000,
+      last_token_usage: {
+        total_tokens: 54321,
+      },
+    },
+  });
+
+  assert.equal(usage.totalTokens, 54321);
+  assert.equal(usage.contextLimit, 200000);
+  assert.equal(usage.hasBreakdown, false);
+});
+
+test("normalizeContextReading converts context meter fallback", () => {
+  const helpers = loadHelpers();
+  const metric = helpers.normalizeContextReading({
+    used: 46205,
+    limit: 258400,
+    source: "message",
+    conversationId: "abc",
+  });
+
+  assert.equal(metric.usage.totalTokens, 46205);
+  assert.equal(metric.usage.contextLimit, 258400);
+  assert.equal(metric.usage.hasBreakdown, false);
+  assert.equal(metric.conversationId, "abc");
+});
+
 test("formatBadgeText includes tokens, cache, and seconds", () => {
   const helpers = loadHelpers();
   const text = helpers.formatBadgeText({
@@ -115,4 +175,24 @@ test("formatBadgeText includes tokens, cache, and seconds", () => {
   });
 
   assert.equal(text, "Tokens 1,250 · 输入 1,000 · 输出 250 · 缓存 600 · 耗时 12.3s");
+});
+
+test("formatBadgeText labels unknown breakdown from fallback", () => {
+  const helpers = loadHelpers();
+  const text = helpers.formatBadgeText({
+    usage: {
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 46205,
+      cachedTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      hasBreakdown: false,
+      contextUsed: 46205,
+      contextLimit: 258400,
+    },
+    elapsedMs: 0,
+  });
+
+  assert.equal(text, "Tokens 46,205 · 输入 - · 输出 - · 上下文 46,205/258,400 · 耗时 -");
 });

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-05-23T10:53:00+08:00",
+  "updated_at": "2026-05-23T11:26:36+08:00",
   "scripts": [
     {
       "id": "codex-token-usage",
@@ -11,7 +11,7 @@
       "tags": ["codex", "tokens", "usage", "metrics"],
       "homepage": "https://github.com/kokotao/codex-token-usage-script",
       "script_url": "https://raw.githubusercontent.com/kokotao/codex-token-usage-script/main/scripts/codex-token-usage.js",
-      "sha256": "fc9289bcc4ea6ef3dbc8dfb677ccf1ffcee6a57c5d11cd1063e9bd29b470f3d8"
+      "sha256": "e6e9425e35035b5753e981421de470ee6a54c62a658ab468b57a675123497d35"
     }
   ]
 }
