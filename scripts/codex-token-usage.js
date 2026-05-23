@@ -6,6 +6,7 @@
   const STYLE_ID = "codex-token-usage-style";
   const RECENT_LIMIT = 20;
   const CONTEXT_POLL_INTERVAL_MS = 1000;
+  const STORAGE_KEY = "__codexTokenUsageRecentDetails";
 
   if (window.__codexTokenUsageScriptInstalled) return;
   window.__codexTokenUsageScriptInstalled = true;
@@ -157,15 +158,35 @@
     return `${(Math.max(0, normalizeNumber(elapsedMs)) / 1000).toFixed(1)}s`;
   }
 
+  function usageHasBreakdown(usage) {
+    return !!(
+      usage &&
+      (usage.hasBreakdown ||
+        usage.inputTokens ||
+        usage.outputTokens ||
+        usage.cachedTokens ||
+        usage.cacheReadTokens ||
+        usage.cacheCreationTokens)
+    );
+  }
+
+  function formatCacheDetails(usage) {
+    const cacheTokens = usage.cachedTokens || usage.cacheReadTokens || 0;
+    if (!cacheTokens) return [];
+    const details = [`缓存命中 ${formatNumber(cacheTokens)}`];
+    if (usage.inputTokens) {
+      const ratio = Math.min(100, Math.max(0, (cacheTokens / usage.inputTokens) * 100));
+      details.push(`命中率 ${ratio.toFixed(1)}%`);
+    }
+    if (usage.cacheCreationTokens) details.push(`缓存写 ${formatNumber(usage.cacheCreationTokens)}`);
+    return details;
+  }
+
   function formatBadgeText(metric) {
     const usage = metric?.usage || {};
-    const cacheParts = [];
-    if (usage.cachedTokens) cacheParts.push(`缓存 ${formatNumber(usage.cachedTokens)}`);
-    if (usage.cacheReadTokens) cacheParts.push(`缓存读 ${formatNumber(usage.cacheReadTokens)}`);
-    if (usage.cacheCreationTokens) cacheParts.push(`缓存写 ${formatNumber(usage.cacheCreationTokens)}`);
     const parts = [`Tokens ${formatNumber(usage.totalTokens)}`];
-    if (usage.hasBreakdown || usage.inputTokens || usage.outputTokens) {
-      parts.push(`输入 ${formatNumber(usage.inputTokens)}`, `输出 ${formatNumber(usage.outputTokens)}`, ...cacheParts);
+    if (usageHasBreakdown(usage)) {
+      parts.push(`输入 ${formatNumber(usage.inputTokens)}`, `输出 ${formatNumber(usage.outputTokens)}`, ...formatCacheDetails(usage));
     } else {
       parts.push("输入 -", "输出 -");
     }
@@ -214,8 +235,77 @@
     return state.turnStartedAt ? nowMs() - state.turnStartedAt : 0;
   }
 
+  function sameUsage(metric, other) {
+    const usage = metric?.usage || {};
+    const otherUsage = other?.usage || {};
+    if (!usage.totalTokens || !otherUsage.totalTokens) return false;
+    if (usage.totalTokens !== otherUsage.totalTokens) return false;
+    if (metric.conversationId && other.conversationId && metric.conversationId !== other.conversationId) return false;
+    return true;
+  }
+
+  function mergeUsage(preferredUsage, fallbackUsage) {
+    const preferredHasBreakdown = usageHasBreakdown(preferredUsage);
+    const fallbackHasBreakdown = usageHasBreakdown(fallbackUsage);
+    const detailUsage = preferredHasBreakdown || !fallbackHasBreakdown ? preferredUsage : fallbackUsage;
+    const contextUsage = preferredUsage.contextLimit ? preferredUsage : fallbackUsage.contextLimit ? fallbackUsage : preferredUsage.contextUsed ? preferredUsage : fallbackUsage;
+    return {
+      inputTokens: detailUsage.inputTokens || 0,
+      outputTokens: detailUsage.outputTokens || 0,
+      totalTokens: detailUsage.totalTokens || contextUsage.totalTokens || 0,
+      cachedTokens: detailUsage.cachedTokens || 0,
+      cacheReadTokens: detailUsage.cacheReadTokens || 0,
+      cacheCreationTokens: detailUsage.cacheCreationTokens || 0,
+      hasBreakdown: usageHasBreakdown(detailUsage),
+      contextUsed: contextUsage.contextUsed || contextUsage.totalTokens || detailUsage.totalTokens || 0,
+      contextLimit: contextUsage.contextLimit || detailUsage.contextLimit || 0,
+    };
+  }
+
+  function mergeMetric(preferred, fallback) {
+    return {
+      ...fallback,
+      ...preferred,
+      usage: mergeUsage(preferred.usage || {}, fallback.usage || {}),
+      elapsedMs: preferred.elapsedMs || fallback.elapsedMs || 0,
+      conversationId: preferred.conversationId || fallback.conversationId || "",
+      source: preferred.source || fallback.source,
+    };
+  }
+
+  function findMergeCandidate(metric) {
+    const matches = [...state.recent, ...readStoredDetails()].filter((item) => sameUsage(metric, item));
+    return matches.find((item) => usageHasBreakdown(item.usage)) || matches[0] || null;
+  }
+
+  function readStoredDetails() {
+    try {
+      const parsed = JSON.parse(window.sessionStorage?.getItem(STORAGE_KEY) || "[]");
+      return Array.isArray(parsed) ? parsed.filter((item) => item?.usage) : [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function writeStoredDetails(metric) {
+    if (!usageHasBreakdown(metric?.usage)) return;
+    try {
+      const recent = [metric, ...readStoredDetails().filter((item) => !sameUsage(metric, item))].slice(0, RECENT_LIMIT);
+      window.sessionStorage?.setItem(STORAGE_KEY, JSON.stringify(recent));
+    } catch (_) {
+      // Storage can be unavailable in restricted renderer contexts.
+    }
+  }
+
   function rememberMetric(metric) {
     if (!metric?.usage) return;
+    const candidate = findMergeCandidate(metric);
+    if (candidate) {
+      const preferred = usageHasBreakdown(candidate.usage) && !usageHasBreakdown(metric.usage) ? candidate : metric;
+      const fallback = preferred === candidate ? metric : candidate;
+      metric = mergeMetric(preferred, fallback);
+      state.recent = state.recent.filter((item) => item !== candidate);
+    }
     const nextKey = metricKey(metric);
     if (nextKey && nextKey === state.lastMetricKey) {
       scheduleRender();
@@ -229,6 +319,7 @@
     };
     state.recent.unshift(state.lastMetric);
     state.recent = state.recent.slice(0, RECENT_LIMIT);
+    writeStoredDetails(state.lastMetric);
     window.__codexTokenUsage = {
       last: state.lastMetric,
       recent: state.recent.slice(),
@@ -430,6 +521,7 @@
         installContextMeterObserver();
         readContextMeterMetric();
       }, CONTEXT_POLL_INTERVAL_MS);
+      window.__codexTokenUsageContextPollTimer = state.contextPollTimer;
     }
   }
 
@@ -631,8 +723,11 @@
     window.__codexTokenUsageScriptTest = {
       extractUsage,
       formatBadgeText,
+      mergeMetric,
       normalizeUsage,
       normalizeContextReading,
+      rememberMetric,
+      getTokenUsage: () => window.__codexTokenUsage,
     };
   }
 })();

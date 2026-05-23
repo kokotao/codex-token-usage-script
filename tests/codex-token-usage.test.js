@@ -170,11 +170,12 @@ test("formatBadgeText includes tokens, cache, and seconds", () => {
       cachedTokens: 600,
       cacheReadTokens: 0,
       cacheCreationTokens: 0,
+      hasBreakdown: true,
     },
     elapsedMs: 12345,
   });
 
-  assert.equal(text, "Tokens 1,250 · 输入 1,000 · 输出 250 · 缓存 600 · 耗时 12.3s");
+  assert.equal(text, "Tokens 1,250 · 输入 1,000 · 输出 250 · 缓存命中 600 · 命中率 60.0% · 耗时 12.3s");
 });
 
 test("formatBadgeText labels unknown breakdown from fallback", () => {
@@ -195,4 +196,90 @@ test("formatBadgeText labels unknown breakdown from fallback", () => {
   });
 
   assert.equal(text, "Tokens 46,205 · 输入 - · 输出 - · 上下文 46,205/258,400 · 耗时 -");
+});
+
+test("mergeMetric keeps detailed usage when context-only update arrives later", () => {
+  const helpers = loadHelpers();
+  const detailed = {
+    usage: {
+      inputTokens: 127057,
+      outputTokens: 495,
+      totalTokens: 127552,
+      cachedTokens: 125824,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      hasBreakdown: true,
+      contextUsed: 127552,
+      contextLimit: 0,
+    },
+    elapsedMs: 42000,
+    source: "post-message",
+  };
+  const contextOnly = {
+    usage: {
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 127552,
+      cachedTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      hasBreakdown: false,
+      contextUsed: 127552,
+      contextLimit: 258400,
+    },
+    elapsedMs: 0,
+    source: "message",
+    conversationId: "abc",
+  };
+
+  const merged = helpers.mergeMetric(detailed, contextOnly);
+
+  assert.equal(merged.usage.inputTokens, 127057);
+  assert.equal(merged.usage.outputTokens, 495);
+  assert.equal(merged.usage.cachedTokens, 125824);
+  assert.equal(merged.usage.contextLimit, 258400);
+  assert.equal(merged.elapsedMs, 42000);
+  assert.equal(merged.conversationId, "abc");
+});
+
+test("rememberMetric keeps detailed usage after context-only update", () => {
+  const helpers = loadHelpers();
+  helpers.rememberMetric({
+    usage: {
+      inputTokens: 127057,
+      outputTokens: 495,
+      totalTokens: 127552,
+      cachedTokens: 125824,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      hasBreakdown: true,
+      contextUsed: 127552,
+      contextLimit: 0,
+    },
+    elapsedMs: 42000,
+    source: "post-message",
+  });
+  helpers.rememberMetric({
+    usage: {
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 127552,
+      cachedTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      hasBreakdown: false,
+      contextUsed: 127552,
+      contextLimit: 258400,
+    },
+    elapsedMs: 0,
+    source: "message",
+    conversationId: "abc",
+  });
+
+  const last = helpers.getTokenUsage().last;
+  assert.equal(last.usage.inputTokens, 127057);
+  assert.equal(last.usage.outputTokens, 495);
+  assert.equal(last.usage.cachedTokens, 125824);
+  assert.equal(last.usage.contextLimit, 258400);
+  assert.equal(helpers.formatBadgeText(last), "Tokens 127,552 · 输入 127,057 · 输出 495 · 缓存命中 125,824 · 命中率 99.0% · 上下文 127,552/258,400 · 耗时 42.0s");
 });
