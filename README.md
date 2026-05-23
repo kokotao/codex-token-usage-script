@@ -44,6 +44,7 @@ https://raw.githubusercontent.com/kokotao/codex-token-usage-script/main/index.js
 ```text
 Tokens 1,250 · 输入 1,000 · 输出 250 · 缓存 600 · 耗时 12.3s
 ```
+<img width="1590" height="1200" alt="53cc1e7d683b12b70492bad352c23074" src="https://github.com/user-attachments/assets/5429c882-78e7-461e-bc52-8be222346ba2" />
 
 ## 开发验证
 
