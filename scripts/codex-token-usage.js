@@ -453,9 +453,12 @@
   }
 
   function ensureStyle() {
-    if (document.getElementById?.(STYLE_ID)) return;
-    const style = document.createElement("style");
-    style.id = STYLE_ID;
+    let style = document.getElementById?.(STYLE_ID);
+    if (!style) {
+      style = document.createElement("style");
+      style.id = STYLE_ID;
+      document.head?.appendChild(style);
+    }
     style.textContent = `
       .${BADGE_CLASS} {
         display: inline-flex;
@@ -470,11 +473,93 @@
         font: 12px/1.35 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         opacity: .86;
       }
+      .${BADGE_CLASS}[data-placement="message-actions"] {
+        display: flex;
+        width: fit-content;
+        margin: 6px 0 0;
+      }
+      main > .${BADGE_CLASS},
+      body > .${BADGE_CLASS} {
+        display: none !important;
+      }
     `;
-    document.head?.appendChild(style);
+  }
+
+  function visibleRect(node) {
+    if (!(node instanceof Element)) return null;
+    const rect = node.getBoundingClientRect();
+    if (!rect.width && !rect.height) return null;
+    return rect;
+  }
+
+  function isConversationActionButton(node) {
+    if (!(node instanceof Element)) return false;
+    const label = node.getAttribute("aria-label") || "";
+    return /^(复制|喜欢|不喜欢|从此处开始分叉|Copy|Good response|Bad response|Branch from here)$/i.test(label);
+  }
+
+  function isPrimaryConversationActionButton(node) {
+    if (!(node instanceof Element)) return false;
+    const label = node.getAttribute("aria-label") || "";
+    return /^(喜欢|不喜欢|从此处开始分叉|Good response|Bad response|Branch from here)$/i.test(label);
+  }
+
+  function scoreAssistantContainer(node) {
+    if (!(node instanceof Element)) return -1;
+    const rect = visibleRect(node);
+    if (!rect || rect.width < 240 || rect.height < 48) return -1;
+    const text = node.innerText || node.textContent || "";
+    if (!text || text.length < 20) return -1;
+    if (node.querySelector?.("textarea,[contenteditable='true']")) return -1;
+    if (/thread-scroll-container|main-surface|app-shell|timeline/i.test(String(node.className || ""))) return -1;
+
+    let score = 0;
+    if (node.querySelector?.("button[aria-label='复制'],button[aria-label='Copy']")) score += 6;
+    if (node.querySelector?.("button[aria-label='喜欢'],button[aria-label='不喜欢']")) score += 3;
+    if (/group flex min-w-0 flex-col/.test(String(node.className || ""))) score += 5;
+    if (node.querySelector?.("p,li,pre,code")) score += 2;
+    if (rect.height > 80) score += 1;
+    score -= Math.max(0, text.length / 2000);
+    return score;
+  }
+
+  function closestAssistantContainer(fromNode) {
+    let best = null;
+    let bestScore = -1;
+    for (let node = fromNode; node && node !== document.body; node = node.parentElement) {
+      const score = scoreAssistantContainer(node);
+      if (score > bestScore) {
+        best = node;
+        bestScore = score;
+      }
+      if (score >= 10) break;
+    }
+    return bestScore > 0 ? best : null;
+  }
+
+  function latestAssistantFromActionBar() {
+    const buttons = Array.from(document.querySelectorAll("button")).filter(isConversationActionButton);
+    const primaryButtons = buttons.filter(isPrimaryConversationActionButton);
+    const searchButtons = primaryButtons.length ? primaryButtons : buttons;
+    const visibleButtons = searchButtons.filter((button) => {
+      const rect = visibleRect(button);
+      return rect && rect.width > 0 && rect.height > 0;
+    });
+    for (let index = visibleButtons.length - 1; index >= 0; index -= 1) {
+      const container = closestAssistantContainer(visibleButtons[index]);
+      if (container) return container;
+    }
+    for (let index = searchButtons.length - 1; index >= 0; index -= 1) {
+      const container = closestAssistantContainer(searchButtons[index]);
+      if (container) return container;
+    }
+    return null;
   }
 
   function latestAssistantNode() {
+    const actionBarTarget = latestAssistantFromActionBar();
+    if (actionBarTarget) return actionBarTarget;
+
     const selectors = [
       '[data-message-author-role="assistant"]',
       '[data-testid*="assistant"]',
@@ -490,7 +575,7 @@
         // Some Chromium builds do not support every selector shape.
       }
     }
-    return document.querySelector("main") || document.body;
+    return null;
   }
 
   function renderMetric(metric = state.lastMetric) {
@@ -498,6 +583,7 @@
     ensureStyle();
     const target = latestAssistantNode();
     if (!target) return;
+    document.querySelectorAll(`main > .${BADGE_CLASS}, body > .${BADGE_CLASS}`).forEach((node) => node.remove());
     let badge = target.querySelector?.(`:scope > .${BADGE_CLASS}`);
     if (!badge) {
       badge = document.createElement("div");
@@ -505,7 +591,11 @@
       target.appendChild(badge);
     }
     badge.dataset.metricId = metric.id || "";
+    badge.dataset.placement = target === document.querySelector("main") ? "fallback" : "message-actions";
     badge.textContent = formatBadgeText(metric);
+    document.querySelectorAll(`.${BADGE_CLASS}`).forEach((node) => {
+      if (node !== badge) node.remove();
+    });
   }
 
   function scheduleRender() {
