@@ -6,6 +6,7 @@
   const STYLE_ID = "codex-token-usage-style";
   const RECENT_LIMIT = 20;
   const CONTEXT_POLL_INTERVAL_MS = 1000;
+  const TURN_IDLE_TIMEOUT_MS = 120000;
   const STORAGE_KEY = "__codexTokenUsageRecentDetails";
 
   if (window.__codexTokenUsageScriptInstalled) return;
@@ -15,6 +16,8 @@
     lastMetric: null,
     lastMetricKey: "",
     recent: [],
+    currentTurn: null,
+    turnSeq: 0,
     turnStartedAt: 0,
     contextPollTimer: 0,
   };
@@ -176,7 +179,7 @@
     const details = [`缓存命中 ${formatNumber(cacheTokens)}`];
     if (usage.inputTokens) {
       const ratio = Math.min(100, Math.max(0, (cacheTokens / usage.inputTokens) * 100));
-      details.push(`命中率 ${ratio.toFixed(1)}%`);
+      details.push(`缓存命中率 ${ratio.toFixed(1)}%`);
     }
     if (usage.cacheCreationTokens) details.push(`缓存写 ${formatNumber(usage.cacheCreationTokens)}`);
     return details;
@@ -184,17 +187,40 @@
 
   function formatBadgeText(metric) {
     const usage = metric?.usage || {};
-    const parts = [`Tokens ${formatNumber(usage.totalTokens)}`];
+    const parts = [`总计 ${formatNumber(usage.totalTokens)}`];
     if (usageHasBreakdown(usage)) {
       parts.push(`输入 ${formatNumber(usage.inputTokens)}`, `输出 ${formatNumber(usage.outputTokens)}`, ...formatCacheDetails(usage));
     } else {
       parts.push("输入 -", "输出 -");
     }
     if (usage.contextLimit) {
-      parts.push(`上下文 ${formatNumber(usage.contextUsed || usage.totalTokens)}/${formatNumber(usage.contextLimit)}`);
+      const contextUsed = usage.contextUsed || usage.totalTokens;
+      const contextPercent = usage.contextLimit ? ` (${((contextUsed / usage.contextLimit) * 100).toFixed(1)}%)` : "";
+      parts.push(`上下文 ${formatNumber(contextUsed)}/${formatNumber(usage.contextLimit)}${contextPercent}`);
     }
+    if (metric?.callCount > 1) parts.push(`调用 ${formatNumber(metric.callCount)} 次`);
     parts.push(`耗时 ${Number.isFinite(metric?.elapsedMs) && metric.elapsedMs > 0 ? formatSeconds(metric.elapsedMs) : "-"}`);
     return parts.join(" · ");
+  }
+
+  function parseElapsedMs(text) {
+    const value = String(text || "");
+    const patterns = [
+      /(?:已处理|处理耗时|耗时|Processed)\s*(?:(\d+(?:\.\d+)?)\s*(?:m|min|分钟|分))?\s*(?:(\d+(?:\.\d+)?)\s*(?:s|sec|秒))?/gi,
+      /(?:已处理|处理耗时|耗时|Processed)\s*(\d+(?:\.\d+)?)\s*(?:s|sec|秒)?/gi,
+    ];
+    let best = 0;
+    for (const pattern of patterns) {
+      let match = pattern.exec(value);
+      while (match) {
+        const first = Number(match[1] || 0);
+        const second = Number(match[2] || 0);
+        const seconds = match.length > 2 ? first * 60 + second : first;
+        if (Number.isFinite(seconds) && seconds > best) best = seconds;
+        match = pattern.exec(value);
+      }
+    }
+    return best ? Math.round(best * 1000) : 0;
   }
 
   function nowMs() {
@@ -223,12 +249,59 @@
       usage.cachedTokens || 0,
       usage.cacheReadTokens || 0,
       usage.cacheCreationTokens || 0,
+      usage.contextUsed || 0,
       usage.contextLimit || 0,
+      metric?.callCount || 0,
+      metric?.elapsedMs || 0,
     ].join(":");
   }
 
-  function markTurnStarted(started = nowMs()) {
+  function usageCallKey(metric) {
+    const usage = metric?.usage || {};
+    return [
+      metric?.conversationId || "",
+      usage.totalTokens || 0,
+      usage.inputTokens || 0,
+      usage.outputTokens || 0,
+      usage.cachedTokens || 0,
+      usage.cacheReadTokens || 0,
+      usage.cacheCreationTokens || 0,
+    ].join(":");
+  }
+
+  function createTurn(started = nowMs()) {
+    state.turnSeq += 1;
+    return {
+      id: `${Date.now()}-${state.turnSeq}`,
+      startedAt: started,
+      lastUpdatedAt: started,
+      calls: [],
+      callKeys: new Set(),
+      contextUsage: null,
+      conversationId: "",
+      elapsedMs: 0,
+    };
+  }
+
+  function beginTurn(started = nowMs()) {
+    state.currentTurn = createTurn(started);
     state.turnStartedAt = started;
+    return state.currentTurn;
+  }
+
+  function ensureTurnStarted(started = nowMs()) {
+    if (
+      !state.currentTurn ||
+      (state.currentTurn.calls.length && started - state.currentTurn.lastUpdatedAt > TURN_IDLE_TIMEOUT_MS)
+    ) {
+      return beginTurn(started);
+    }
+    if (!state.turnStartedAt) state.turnStartedAt = state.currentTurn.startedAt || started;
+    return state.currentTurn;
+  }
+
+  function markTurnStarted(started = nowMs()) {
+    beginTurn(started);
   }
 
   function elapsedSinceTurnStarted() {
@@ -297,15 +370,43 @@
     }
   }
 
-  function rememberMetric(metric) {
-    if (!metric?.usage) return;
-    const candidate = findMergeCandidate(metric);
-    if (candidate) {
-      const preferred = usageHasBreakdown(candidate.usage) && !usageHasBreakdown(metric.usage) ? candidate : metric;
-      const fallback = preferred === candidate ? metric : candidate;
-      metric = mergeMetric(preferred, fallback);
-      state.recent = state.recent.filter((item) => item !== candidate);
-    }
+  function aggregateTurnMetric(turn) {
+    const usage = turn.calls.reduce(
+      (total, call) => {
+        const item = call.usage || {};
+        total.inputTokens += item.inputTokens || 0;
+        total.outputTokens += item.outputTokens || 0;
+        total.totalTokens += item.totalTokens || item.inputTokens + item.outputTokens || 0;
+        total.cachedTokens += item.cachedTokens || 0;
+        total.cacheReadTokens += item.cacheReadTokens || 0;
+        total.cacheCreationTokens += item.cacheCreationTokens || 0;
+        return total;
+      },
+      {
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        cachedTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+      },
+    );
+    const lastCallUsage = turn.calls[turn.calls.length - 1]?.usage || {};
+    const contextUsage = turn.contextUsage || (lastCallUsage.contextLimit ? lastCallUsage : null);
+    usage.hasBreakdown = turn.calls.length > 0;
+    usage.contextUsed = contextUsage?.contextUsed || contextUsage?.totalTokens || lastCallUsage.contextUsed || usage.totalTokens;
+    usage.contextLimit = contextUsage?.contextLimit || lastCallUsage.contextLimit || 0;
+    return {
+      usage,
+      elapsedMs: turn.elapsedMs,
+      source: "turn-aggregate",
+      conversationId: turn.conversationId,
+      turnId: turn.id,
+      callCount: turn.calls.length,
+    };
+  }
+
+  function publishMetric(metric, storeDetails = true) {
     const nextKey = metricKey(metric);
     if (nextKey && nextKey === state.lastMetricKey) {
       scheduleRender();
@@ -319,12 +420,68 @@
     };
     state.recent.unshift(state.lastMetric);
     state.recent = state.recent.slice(0, RECENT_LIMIT);
-    writeStoredDetails(state.lastMetric);
     window.__codexTokenUsage = {
       last: state.lastMetric,
+      currentTurn: state.currentTurn
+        ? {
+            id: state.currentTurn.id,
+            startedAt: state.currentTurn.startedAt,
+            lastUpdatedAt: state.currentTurn.lastUpdatedAt,
+            callCount: state.currentTurn.calls.length,
+            conversationId: state.currentTurn.conversationId,
+          }
+        : null,
       recent: state.recent.slice(),
     };
+    if (storeDetails) writeStoredDetails(state.lastMetric);
     scheduleRender();
+  }
+
+  function rememberContextMetric(metric) {
+    if (state.currentTurn?.calls.length) {
+      state.currentTurn.contextUsage = metric.usage;
+      state.currentTurn.conversationId = metric.conversationId || state.currentTurn.conversationId;
+      state.currentTurn.elapsedMs = Math.max(state.currentTurn.elapsedMs || 0, metric.elapsedMs || 0);
+      state.currentTurn.lastUpdatedAt = nowMs();
+      publishMetric(aggregateTurnMetric(state.currentTurn), false);
+      return;
+    }
+    if (state.lastMetric) {
+      publishMetric(mergeMetric(state.lastMetric, metric), false);
+      return;
+    }
+    publishMetric({ ...metric, callCount: 0 }, false);
+  }
+
+  function rememberUsageMetric(metric) {
+    const turn = ensureTurnStarted();
+    const key = usageCallKey(metric);
+    const existing = turn.calls.find((call) => call.__usageCallKey === key);
+    if (existing) {
+      const merged = mergeMetric(metric, existing);
+      Object.assign(existing, merged, { __usageCallKey: key });
+    } else {
+      const candidate = findMergeCandidate(metric);
+      if (candidate) {
+        metric = mergeMetric(metric, candidate);
+      }
+      turn.calls.push({ ...metric, __usageCallKey: key });
+      turn.callKeys.add(key);
+    }
+    turn.conversationId = metric.conversationId || turn.conversationId;
+    turn.elapsedMs = Math.max(turn.elapsedMs || 0, metric.elapsedMs || elapsedSinceTurnStarted());
+    turn.lastUpdatedAt = nowMs();
+    publishMetric(aggregateTurnMetric(turn));
+    writeStoredDetails(metric);
+  }
+
+  function rememberMetric(metric) {
+    if (!metric?.usage) return;
+    if (usageHasBreakdown(metric.usage)) {
+      rememberUsageMetric(metric);
+    } else {
+      rememberContextMetric(metric);
+    }
   }
 
   function parseResponseText(text, elapsedMs, url) {
@@ -351,7 +508,7 @@
     function wrappedFetch(input, init) {
       const url = requestUrl(input);
       const started = nowMs();
-      if (isCodexApiUrl(url)) markTurnStarted(started);
+      if (isCodexApiUrl(url)) ensureTurnStarted(started);
       return originalFetch(input, init).then((response) => {
         if (isCodexApiUrl(url) && response?.clone) {
           response
@@ -378,7 +535,7 @@
     };
     Xhr.prototype.send = function send(...args) {
       const started = nowMs();
-      if (isCodexApiUrl(this.__codexTokenUsageUrl)) markTurnStarted(started);
+      if (isCodexApiUrl(this.__codexTokenUsageUrl)) ensureTurnStarted(started);
       this.addEventListener?.("loadend", () => {
         const url = this.__codexTokenUsageUrl;
         if (!isCodexApiUrl(url)) return;
@@ -670,11 +827,25 @@
     return null;
   }
 
+  function elapsedFromAssistantNode(node) {
+    for (let current = node; current && current !== document.body; current = current.parentElement) {
+      const text = current.innerText || current.textContent || "";
+      if (text.length > 6000) break;
+      const elapsedMs = parseElapsedMs(text);
+      if (elapsedMs) return elapsedMs;
+    }
+    return 0;
+  }
+
   function renderMetric(metric = state.lastMetric) {
     if (!metric) return;
     ensureStyle();
     const target = latestAssistantNode();
     if (!target) return;
+    const displayMetric = {
+      ...metric,
+      elapsedMs: elapsedFromAssistantNode(target) || metric.elapsedMs,
+    };
     document.querySelectorAll(`main > .${BADGE_CLASS}, body > .${BADGE_CLASS}`).forEach((node) => node.remove());
     let badge = target.querySelector?.(`:scope > .${BADGE_CLASS}`);
     if (!badge) {
@@ -682,9 +853,9 @@
       badge.className = BADGE_CLASS;
       target.appendChild(badge);
     }
-    badge.dataset.metricId = metric.id || "";
+    badge.dataset.metricId = displayMetric.id || "";
     badge.dataset.placement = target === document.querySelector("main") ? "fallback" : "message-actions";
-    badge.textContent = formatBadgeText(metric);
+    badge.textContent = formatBadgeText(displayMetric);
     document.querySelectorAll(`.${BADGE_CLASS}`).forEach((node) => {
       if (node !== badge) node.remove();
     });
@@ -726,6 +897,7 @@
       mergeMetric,
       normalizeUsage,
       normalizeContextReading,
+      parseElapsedMs,
       rememberMetric,
       getTokenUsage: () => window.__codexTokenUsage,
     };

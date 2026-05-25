@@ -175,7 +175,7 @@ test("formatBadgeText includes tokens, cache, and seconds", () => {
     elapsedMs: 12345,
   });
 
-  assert.equal(text, "Tokens 1,250 · 输入 1,000 · 输出 250 · 缓存命中 600 · 命中率 60.0% · 耗时 12.3s");
+  assert.equal(text, "总计 1,250 · 输入 1,000 · 输出 250 · 缓存命中 600 · 缓存命中率 60.0% · 耗时 12.3s");
 });
 
 test("formatBadgeText labels unknown breakdown from fallback", () => {
@@ -195,7 +195,7 @@ test("formatBadgeText labels unknown breakdown from fallback", () => {
     elapsedMs: 0,
   });
 
-  assert.equal(text, "Tokens 46,205 · 输入 - · 输出 - · 上下文 46,205/258,400 · 耗时 -");
+  assert.equal(text, "总计 46,205 · 输入 - · 输出 - · 上下文 46,205/258,400 (17.9%) · 耗时 -");
 });
 
 test("mergeMetric keeps detailed usage when context-only update arrives later", () => {
@@ -281,5 +281,144 @@ test("rememberMetric keeps detailed usage after context-only update", () => {
   assert.equal(last.usage.outputTokens, 495);
   assert.equal(last.usage.cachedTokens, 125824);
   assert.equal(last.usage.contextLimit, 258400);
-  assert.equal(helpers.formatBadgeText(last), "Tokens 127,552 · 输入 127,057 · 输出 495 · 缓存命中 125,824 · 命中率 99.0% · 上下文 127,552/258,400 · 耗时 42.0s");
+  assert.equal(helpers.formatBadgeText(last), "总计 127,552 · 输入 127,057 · 输出 495 · 缓存命中 125,824 · 缓存命中率 99.0% · 上下文 127,552/258,400 (49.4%) · 耗时 42.0s");
+});
+
+test("rememberMetric aggregates multiple model calls in one Codex turn", () => {
+  const helpers = loadHelpers();
+
+  helpers.rememberMetric({
+    usage: {
+      inputTokens: 1000,
+      outputTokens: 100,
+      totalTokens: 1100,
+      cachedTokens: 600,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      hasBreakdown: true,
+      contextUsed: 1100,
+      contextLimit: 0,
+    },
+    elapsedMs: 10000,
+    source: "post-message",
+    conversationId: "abc",
+  });
+  helpers.rememberMetric({
+    usage: {
+      inputTokens: 2000,
+      outputTokens: 250,
+      totalTokens: 2250,
+      cachedTokens: 1200,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      hasBreakdown: true,
+      contextUsed: 2250,
+      contextLimit: 0,
+    },
+    elapsedMs: 24000,
+    source: "websocket",
+    conversationId: "abc",
+  });
+
+  const last = helpers.getTokenUsage().last;
+  assert.equal(last.usage.inputTokens, 3000);
+  assert.equal(last.usage.outputTokens, 350);
+  assert.equal(last.usage.totalTokens, 3350);
+  assert.equal(last.usage.cachedTokens, 1800);
+  assert.equal(last.callCount, 2);
+  assert.equal(helpers.formatBadgeText(last), "总计 3,350 · 输入 3,000 · 输出 350 · 缓存命中 1,800 · 缓存命中率 60.0% · 调用 2 次 · 耗时 24.0s");
+});
+
+test("rememberMetric deduplicates the same model call across observers", () => {
+  const helpers = loadHelpers();
+  const usage = {
+    inputTokens: 1200,
+    outputTokens: 120,
+    totalTokens: 1320,
+    cachedTokens: 900,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    hasBreakdown: true,
+    contextUsed: 1320,
+    contextLimit: 0,
+  };
+
+  helpers.rememberMetric({ usage, elapsedMs: 9000, source: "message", conversationId: "abc" });
+  helpers.rememberMetric({ usage, elapsedMs: 11000, source: "post-message", conversationId: "abc" });
+
+  const last = helpers.getTokenUsage().last;
+  assert.equal(last.usage.inputTokens, 1200);
+  assert.equal(last.usage.outputTokens, 120);
+  assert.equal(last.usage.totalTokens, 1320);
+  assert.equal(last.callCount, 1);
+  assert.equal(last.elapsedMs, 11000);
+});
+
+test("rememberMetric applies context-only update to aggregated turn without adding a call", () => {
+  const helpers = loadHelpers();
+
+  helpers.rememberMetric({
+    usage: {
+      inputTokens: 1000,
+      outputTokens: 100,
+      totalTokens: 1100,
+      cachedTokens: 600,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      hasBreakdown: true,
+      contextUsed: 1100,
+      contextLimit: 0,
+    },
+    elapsedMs: 10000,
+    source: "post-message",
+    conversationId: "abc",
+  });
+  helpers.rememberMetric({
+    usage: {
+      inputTokens: 2000,
+      outputTokens: 250,
+      totalTokens: 2250,
+      cachedTokens: 1200,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      hasBreakdown: true,
+      contextUsed: 2250,
+      contextLimit: 0,
+    },
+    elapsedMs: 24000,
+    source: "websocket",
+    conversationId: "abc",
+  });
+  helpers.rememberMetric({
+    usage: {
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 5000,
+      cachedTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      hasBreakdown: false,
+      contextUsed: 5000,
+      contextLimit: 258400,
+    },
+    elapsedMs: 26000,
+    source: "context-meter",
+    conversationId: "abc",
+  });
+
+  const last = helpers.getTokenUsage().last;
+  assert.equal(last.usage.inputTokens, 3000);
+  assert.equal(last.usage.outputTokens, 350);
+  assert.equal(last.usage.totalTokens, 3350);
+  assert.equal(last.usage.contextUsed, 5000);
+  assert.equal(last.usage.contextLimit, 258400);
+  assert.equal(last.callCount, 2);
+});
+
+test("parseElapsedMs reads Codex processed duration text", () => {
+  const helpers = loadHelpers();
+
+  assert.equal(helpers.parseElapsedMs("已处理 2m 7s"), 127000);
+  assert.equal(helpers.parseElapsedMs("已处理 45s"), 45000);
+  assert.equal(helpers.parseElapsedMs("Processed 1m 5s"), 65000);
 });
