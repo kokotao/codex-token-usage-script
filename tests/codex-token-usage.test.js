@@ -1,14 +1,18 @@
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
 
+const SCRIPT_PATH = path.join(__dirname, "..", "scripts", "codex-token-usage.js");
+
+function readScriptForDistribution() {
+  return fs.readFileSync(SCRIPT_PATH, "utf8").replace(/\r\n/g, "\n");
+}
+
 function loadHelpers() {
-  const source = fs.readFileSync(
-    path.join(__dirname, "..", "scripts", "codex-token-usage.js"),
-    "utf8",
-  );
+  const source = readScriptForDistribution();
   const sandbox = {
     console,
     setTimeout,
@@ -66,6 +70,20 @@ function loadHelpers() {
   vm.runInContext(source, sandbox);
   return sandbox.window.__codexTokenUsageScriptTest;
 }
+
+test("index checksum matches distributed script bytes", () => {
+  const index = JSON.parse(
+    fs.readFileSync(path.join(__dirname, "..", "index.json"), "utf8"),
+  );
+  const script = index.scripts.find((item) => item.id === "codex-token-usage");
+  const hash = crypto
+    .createHash("sha256")
+    .update(readScriptForDistribution(), "utf8")
+    .digest("hex");
+
+  assert.ok(script, "codex-token-usage script entry exists");
+  assert.equal(script.sha256, hash);
+});
 
 test("extractUsage finds Responses API usage from JSON", () => {
   const helpers = loadHelpers();
