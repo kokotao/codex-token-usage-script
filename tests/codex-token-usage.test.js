@@ -19,6 +19,7 @@ function loadHelpers() {
     clearInterval() {},
     document: {
       readyState: "complete",
+      listeners: {},
       createElement() {
         return {
           className: "",
@@ -39,7 +40,9 @@ function loadHelpers() {
       querySelectorAll() {
         return [];
       },
-      addEventListener() {},
+      addEventListener(type, handler) {
+        this.listeners[type] = handler;
+      },
     },
     MutationObserver: class {
       observe() {}
@@ -65,6 +68,20 @@ function loadHelpers() {
   vm.createContext(sandbox);
   vm.runInContext(source, sandbox);
   return sandbox.window.__codexTokenUsageScriptTest;
+}
+
+function detailedUsage(totalTokens = 1320) {
+  return {
+    inputTokens: totalTokens - 120,
+    outputTokens: 120,
+    totalTokens,
+    cachedTokens: 900,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    hasBreakdown: true,
+    contextUsed: totalTokens,
+    contextLimit: 0,
+  };
 }
 
 test("extractUsage finds Responses API usage from JSON", () => {
@@ -413,6 +430,58 @@ test("rememberMetric applies context-only update to aggregated turn without addi
   assert.equal(last.usage.contextUsed, 5000);
   assert.equal(last.usage.contextLimit, 258400);
   assert.equal(last.callCount, 2);
+});
+
+test("running status is scoped to the active conversation", () => {
+  const helpers = loadHelpers();
+
+  helpers.setActiveConversationId("thread-a");
+  helpers.markTurnStarted();
+
+  let status = helpers.getDisplayMetric();
+  assert.equal(status.status, "running");
+  assert.equal(status.conversationId, "thread-a");
+  assert.equal(helpers.formatBadgeText(status), "运行中 · 正在统计本次回复 token...");
+
+  helpers.setActiveConversationId("thread-b");
+  assert.equal(helpers.getDisplayMetric(), null);
+});
+
+test("typing or pressing enter does not show running before an API request", () => {
+  const helpers = loadHelpers();
+
+  helpers.setActiveConversationId("thread-a");
+  helpers.dispatchDocumentEvent("keydown", {
+    key: "Enter",
+    shiftKey: false,
+    target: { tagName: "TEXTAREA", ariaLabel: "", textContent: "hello" },
+  });
+
+  assert.equal(helpers.getDisplayMetric(), null);
+});
+
+test("conversation switch does not display previous conversation metric", () => {
+  const helpers = loadHelpers();
+
+  helpers.setActiveConversationId("thread-a");
+  helpers.rememberMetric({ usage: detailedUsage(1320), elapsedMs: 11000, source: "network" });
+  assert.equal(helpers.getDisplayMetric().conversationId, "thread-a");
+
+  helpers.setActiveConversationId("thread-b");
+  assert.equal(helpers.getDisplayMetric(), null);
+});
+
+test("conversation switch restores cached metric for that conversation", () => {
+  const helpers = loadHelpers();
+
+  helpers.setActiveConversationId("thread-a");
+  helpers.rememberMetric({ usage: detailedUsage(1320), elapsedMs: 11000, source: "network" });
+  helpers.setActiveConversationId("thread-b");
+  helpers.rememberMetric({ usage: detailedUsage(2450), elapsedMs: 15000, source: "network" });
+
+  assert.equal(helpers.getDisplayMetric().usage.totalTokens, 2450);
+  helpers.setActiveConversationId("thread-a");
+  assert.equal(helpers.getDisplayMetric().usage.totalTokens, 1320);
 });
 
 test("parseElapsedMs reads Codex processed duration text", () => {
