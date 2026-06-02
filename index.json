@@ -1,17 +1,22 @@
 {
   "version": 1,
-  "updated_at": "2026-05-23T13:59:37+08:00",
+  "updated_at": "2026-06-02T06:07:06.349Z",
   "scripts": [
     {
       "id": "codex-token-usage",
       "name": "Codex Token Usage",
       "description": "在 Codex 每次回复完成后显示本次响应的输入、输出、缓存 token 和耗时。",
-      "version": "0.1.0",
+      "version": "0.1.5",
       "author": "Albert_Luo",
-      "tags": ["codex", "tokens", "usage", "metrics"],
+      "tags": [
+        "codex",
+        "tokens",
+        "usage",
+        "metrics"
+      ],
       "homepage": "https://github.com/kokotao/codex-token-usage-script",
       "script_url": "https://raw.githubusercontent.com/kokotao/codex-token-usage-script/main/scripts/codex-token-usage.js",
-      "sha256": "a163bd62d886cd738adaa3966cfc92465892cea2cc9d4fd1dabecc4cc517fd2a"
+      "sha256": "2bffb40de30ed4406713b188682b8f1c9d21163a27fe5a03ad041bf20d6b0025"
     }
   ]
 }
