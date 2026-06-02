@@ -9,6 +9,16 @@ function loadHelpers() {
     path.join(__dirname, "..", "scripts", "codex-token-usage.js"),
     "utf8",
   );
+  let currentNow = 1000;
+  const sessionStorage = {
+    values: Object.create(null),
+    getItem(key) {
+      return this.values[key] ?? null;
+    },
+    setItem(key, value) {
+      this.values[key] = String(value);
+    },
+  };
   const sandbox = {
     console,
     setTimeout,
@@ -49,12 +59,13 @@ function loadHelpers() {
       disconnect() {}
     },
     location: { href: "https://chatgpt.com/codex" },
-    performance: { now: () => 1000 },
+    performance: { now: () => currentNow },
     window: {
       __CODEX_TOKEN_USAGE_SCRIPT_TEST__: true,
       addEventListener() {},
       location: { href: "https://chatgpt.com/codex" },
-      performance: { now: () => 1000 },
+      performance: { now: () => currentNow },
+      sessionStorage,
     },
   };
   sandbox.window.window = sandbox.window;
@@ -67,7 +78,68 @@ function loadHelpers() {
   sandbox.window.console = console;
   vm.createContext(sandbox);
   vm.runInContext(source, sandbox);
-  return sandbox.window.__codexTokenUsageScriptTest;
+  return {
+    ...sandbox.window.__codexTokenUsageScriptTest,
+    advanceTime(ms) {
+      currentNow += ms;
+    },
+  };
+}
+
+function loadWindow(overrides = {}) {
+  const source = fs.readFileSync(
+    path.join(__dirname, "..", "scripts", "codex-token-usage.js"),
+    "utf8",
+  );
+  const sandbox = {
+    console,
+    setTimeout,
+    clearTimeout,
+    setInterval() {
+      return 1;
+    },
+    clearInterval() {},
+    document: {
+      readyState: "complete",
+      listeners: {},
+      createElement() {
+        return { dataset: {}, style: {}, appendChild() {} };
+      },
+      querySelector() {
+        return null;
+      },
+      querySelectorAll() {
+        return [];
+      },
+      addEventListener(type, handler) {
+        this.listeners[type] = handler;
+      },
+    },
+    MutationObserver: class {
+      observe() {}
+      disconnect() {}
+    },
+    location: { href: "https://chatgpt.com/codex" },
+    performance: { now: () => 1000 },
+    window: {
+      __CODEX_TOKEN_USAGE_SCRIPT_TEST__: true,
+      addEventListener() {},
+      location: { href: "https://chatgpt.com/codex" },
+      performance: { now: () => 1000 },
+      ...overrides,
+    },
+  };
+  sandbox.window.window = sandbox.window;
+  sandbox.window.document = sandbox.document;
+  sandbox.window.MutationObserver = sandbox.MutationObserver;
+  sandbox.window.setTimeout = setTimeout;
+  sandbox.window.clearTimeout = clearTimeout;
+  sandbox.window.setInterval = sandbox.setInterval;
+  sandbox.window.clearInterval = sandbox.clearInterval;
+  sandbox.window.console = console;
+  vm.createContext(sandbox);
+  vm.runInContext(source, sandbox);
+  return sandbox.window;
 }
 
 function detailedUsage(totalTokens = 1320) {
@@ -110,6 +182,21 @@ test("extractUsage finds Responses API usage from JSON", () => {
   });
 });
 
+test("script exposes version and reinstalls over older injected version", () => {
+  const win = loadWindow({
+    __codexTokenUsageScriptInstalled: true,
+    __codexTokenUsageVersion: "0.1.3",
+    __codexTokenUsageMessageObserver: "0.1.3",
+  });
+
+  assert.equal(win.__codexTokenUsageVersion, "0.1.5");
+  assert.equal(win.__codexTokenUsageMessageObserver, "0.1.5");
+  assert.equal(Array.isArray(win.__codexTokenUsageDebug), true);
+  assert.equal(win.__codexTokenUsageDebug.length, 0);
+  assert.equal(win.__codexTokenUsage.version, "0.1.5");
+  assert.equal(typeof win.__codexTokenUsageScriptTest?.processPayload, "function");
+});
+
 test("extractUsage finds usage from SSE text", () => {
   const helpers = loadHelpers();
   const usage = helpers.extractUsage(
@@ -124,6 +211,154 @@ test("extractUsage finds usage from SSE text", () => {
   assert.equal(usage.outputTokens, 5);
   assert.equal(usage.totalTokens, 15);
   assert.equal(usage.cacheReadTokens, 4);
+});
+
+test("processPayload aggregates all token_count events from one SSE stream", () => {
+  const helpers = loadHelpers();
+  helpers.setActiveConversationId("thread-a");
+  const calls = [
+    { input: 219064, output: 821, cached: 1920 },
+    { input: 227050, output: 1192, cached: 0 },
+    { input: 22720, output: 719, cached: 5504 },
+    { input: 31484, output: 511, cached: 22400 },
+    { input: 37206, output: 583, cached: 31104 },
+    { input: 49027, output: 2765, cached: 36736 },
+    { input: 51864, output: 366, cached: 48512 },
+  ];
+  const stream = calls
+    .map(
+      (call) =>
+        [
+          "event: token_count",
+          `data: {"type":"token_count","info":{"model_context_window":258400,"last_token_usage":{"input_tokens":${call.input},"cached_input_tokens":${call.cached},"output_tokens":${call.output},"total_tokens":${call.input + call.output}}}}`,
+          "",
+        ].join("\n"),
+    )
+    .join("\n");
+
+  helpers.processPayload(stream, "network", "thread-a", 330000);
+
+  const last = helpers.getTokenUsage().last;
+  assert.equal(last.usage.inputTokens, 638415);
+  assert.equal(last.usage.outputTokens, 6957);
+  assert.equal(last.usage.totalTokens, 645372);
+  assert.equal(last.usage.cachedTokens, 146176);
+  assert.equal(last.usage.contextLimit, 258400);
+  assert.equal(last.callCount, 7);
+});
+
+test("processPayload aggregates all usage entries from one post-message array", () => {
+  const helpers = loadHelpers();
+  helpers.setActiveConversationId("local:019e80d6-ffb9-7193-a84c-ce6374eae5c9");
+  const payload = [
+    {
+      elapsedMs: 24430.100000023842,
+      source: "post-message",
+      conversationId: "local:019e80d6-ffb9-7193-a84c-ce6374eae5c9",
+      usage: {
+        inputTokens: 30223,
+        outputTokens: 316,
+        totalTokens: 30539,
+        cachedTokens: 29568,
+        contextUsed: 30539,
+        contextLimit: 258400,
+      },
+    },
+    {
+      elapsedMs: 36040,
+      source: "post-message",
+      conversationId: "local:019e80d6-ffb9-7193-a84c-ce6374eae5c9",
+      usage: {
+        inputTokens: 29649,
+        outputTokens: 392,
+        totalTokens: 30041,
+        cachedTokens: 3456,
+        contextUsed: 30041,
+        contextLimit: 258400,
+      },
+    },
+    {
+      elapsedMs: 4336.300000011921,
+      source: "post-message",
+      conversationId: "local:019e80d6-ffb9-7193-a84c-ce6374eae5c9",
+      usage: {
+        inputTokens: 207485,
+        outputTokens: 1522,
+        totalTokens: 209007,
+        cachedTokens: 3840,
+        contextUsed: 209007,
+        contextLimit: 258400,
+      },
+    },
+    {
+      elapsedMs: 446080.1999999881,
+      source: "post-message",
+      conversationId: "local:019e80d6-ffb9-7193-a84c-ce6374eae5c9",
+      usage: {
+        inputTokens: 213158,
+        outputTokens: 237,
+        totalTokens: 213395,
+        cachedTokens: 210304,
+        contextUsed: 213395,
+        contextLimit: 258400,
+      },
+    },
+    {
+      elapsedMs: 151140.40000003576,
+      source: "post-message",
+      conversationId: "local:019e80d6-ffb9-7193-a84c-ce6374eae5c9",
+      usage: {
+        inputTokens: 211198,
+        outputTokens: 1065,
+        totalTokens: 212263,
+        cachedTokens: 208768,
+        contextUsed: 212263,
+        contextLimit: 258400,
+      },
+    },
+    {
+      elapsedMs: 180124.30000001192,
+      source: "post-message",
+      conversationId: "local:019e80d6-ffb9-7193-a84c-ce6374eae5c9",
+      usage: {
+        inputTokens: 209649,
+        outputTokens: 857,
+        totalTokens: 210506,
+        cachedTokens: 208256,
+        contextUsed: 210506,
+        contextLimit: 258400,
+      },
+    },
+    {
+      elapsedMs: 0,
+      source: "post-message",
+      conversationId: "local:019e80d6-ffb9-7193-a84c-ce6374eae5c9",
+      usage: {
+        inputTokens: 209157,
+        outputTokens: 466,
+        totalTokens: 209623,
+        cachedTokens: 207232,
+        contextUsed: 209623,
+        contextLimit: 258400,
+      },
+    },
+  ];
+
+  helpers.processPayload(payload, "post-message", "local:019e80d6-ffb9-7193-a84c-ce6374eae5c9", 446080);
+
+  const last = helpers.getTokenUsage().last;
+  assert.equal(last.usage.inputTokens, 1110519);
+  assert.equal(last.usage.outputTokens, 4855);
+  assert.equal(last.usage.totalTokens, 1115374);
+  assert.equal(last.usage.cachedTokens, 871424);
+  assert.equal(last.usage.contextUsed, 209623);
+  assert.equal(last.usage.contextLimit, 258400);
+  assert.equal(last.callCount, 7);
+
+  const stored = helpers.getStoredDetails();
+  assert.equal(stored[0].callCount, 7);
+  assert.equal(stored[0].usage.totalTokens, 1115374);
+  assert.equal(stored.every((item) => item.callCount >= 1), true);
 });
 
 test("extractUsage finds Codex latestTokenUsageInfo shape", () => {
@@ -160,6 +395,73 @@ test("extractUsage finds token_count event shape", () => {
   assert.equal(usage.totalTokens, 54321);
   assert.equal(usage.contextLimit, 200000);
   assert.equal(usage.hasBreakdown, false);
+});
+
+test("extractUsage prefers last token_count call usage over cumulative total usage", () => {
+  const helpers = loadHelpers();
+  const usage = helpers.extractUsage({
+    type: "token_count",
+    info: {
+      model_context_window: 200000,
+      total_token_usage: {
+        input_tokens: 5000,
+        cached_input_tokens: 3200,
+        output_tokens: 700,
+        total_tokens: 5700,
+      },
+      last_token_usage: {
+        input_tokens: 1200,
+        cached_input_tokens: 800,
+        output_tokens: 100,
+        total_tokens: 1300,
+      },
+    },
+  });
+
+  assert.equal(usage.inputTokens, 1200);
+  assert.equal(usage.outputTokens, 100);
+  assert.equal(usage.totalTokens, 1300);
+  assert.equal(usage.cachedTokens, 800);
+  assert.equal(usage.contextLimit, 200000);
+});
+
+test("rememberMetric aggregates repeated token_count last-call updates", () => {
+  const helpers = loadHelpers();
+
+  helpers.rememberMetric({
+    usage: helpers.extractUsage({
+      type: "token_count",
+      info: {
+        model_context_window: 200000,
+        total_token_usage: { input_tokens: 5000, output_tokens: 700, total_tokens: 5700 },
+        last_token_usage: { input_tokens: 1200, cached_input_tokens: 800, output_tokens: 100, total_tokens: 1300 },
+      },
+    }),
+    elapsedMs: 10000,
+    source: "token-count",
+    conversationId: "abc",
+  });
+  helpers.rememberMetric({
+    usage: helpers.extractUsage({
+      type: "token_count",
+      info: {
+        model_context_window: 200000,
+        total_token_usage: { input_tokens: 7000, output_tokens: 950, total_tokens: 7950 },
+        last_token_usage: { input_tokens: 1800, cached_input_tokens: 900, output_tokens: 220, total_tokens: 2020 },
+      },
+    }),
+    elapsedMs: 18000,
+    source: "token-count",
+    conversationId: "abc",
+  });
+
+  const last = helpers.getTokenUsage().last;
+  assert.equal(last.usage.inputTokens, 3000);
+  assert.equal(last.usage.outputTokens, 320);
+  assert.equal(last.usage.totalTokens, 3320);
+  assert.equal(last.usage.cachedTokens, 1700);
+  assert.equal(last.usage.contextLimit, 200000);
+  assert.equal(last.callCount, 2);
 });
 
 test("normalizeContextReading converts context meter fallback", () => {
@@ -298,7 +600,7 @@ test("rememberMetric keeps detailed usage after context-only update", () => {
   assert.equal(last.usage.outputTokens, 495);
   assert.equal(last.usage.cachedTokens, 125824);
   assert.equal(last.usage.contextLimit, 258400);
-  assert.equal(helpers.formatBadgeText(last), "总计 127,552 · 输入 127,057 · 输出 495 · 缓存命中 125,824 · 缓存命中率 99.0% · 上下文 127,552/258,400 (49.4%) · 耗时 42.0s");
+  assert.equal(helpers.formatBadgeText(last), "总计 127,552 · 输入 127,057 · 输出 495 · 缓存命中 125,824 · 缓存命中率 99.0% · 上下文 127,552/258,400 (49.4%) · 调用 1 次 · 耗时 42.0s");
 });
 
 test("rememberMetric aggregates multiple model calls in one Codex turn", () => {
@@ -346,6 +648,78 @@ test("rememberMetric aggregates multiple model calls in one Codex turn", () => {
   assert.equal(helpers.formatBadgeText(last), "总计 3,350 · 输入 3,000 · 输出 350 · 缓存命中 1,800 · 缓存命中率 60.0% · 调用 2 次 · 耗时 24.0s");
 });
 
+test("rememberMetric keeps long-running assistant calls in the same turn", () => {
+  const helpers = loadHelpers();
+  helpers.setActiveConversationId("thread-a");
+
+  helpers.rememberMetric({ usage: detailedUsage(100963), elapsedMs: 17000, source: "network" });
+  helpers.advanceTime(91000);
+  helpers.rememberMetric({ usage: detailedUsage(100893), elapsedMs: 106000, source: "network" });
+  helpers.advanceTime(123000);
+  helpers.rememberMetric({ usage: detailedUsage(105649), elapsedMs: 213000, source: "network" });
+
+  const last = helpers.getTokenUsage().last;
+  assert.equal(last.usage.totalTokens, 307505);
+  assert.equal(last.callCount, 3);
+});
+
+test("rememberMetric aggregates cached post-message usage entries for one reply", () => {
+  const helpers = loadHelpers();
+  helpers.setActiveConversationId("local:019e80d6-ffb9-7193-a84c-ce6374eae5c9");
+  const entries = [
+    { inputTokens: 199237, outputTokens: 542, totalTokens: 199779, cachedTokens: 196992, elapsedMs: 40886.10000002384 },
+    { inputTokens: 197914, outputTokens: 590, totalTokens: 198504, cachedTokens: 195456, elapsedMs: 42635 },
+    { inputTokens: 196232, outputTokens: 925, totalTokens: 197157, cachedTokens: 10112, elapsedMs: 84791.19999998808 },
+    { inputTokens: 195594, outputTokens: 613, totalTokens: 196207, cachedTokens: 193920, elapsedMs: 0 },
+  ];
+
+  entries.forEach((entry) => {
+    helpers.rememberMetric({
+      elapsedMs: entry.elapsedMs,
+      source: "post-message",
+      conversationId: "local:019e80d6-ffb9-7193-a84c-ce6374eae5c9",
+      usage: {
+        inputTokens: entry.inputTokens,
+        outputTokens: entry.outputTokens,
+        totalTokens: entry.totalTokens,
+        cachedTokens: entry.cachedTokens,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        hasBreakdown: true,
+        contextUsed: entry.totalTokens,
+        contextLimit: 258400,
+      },
+    });
+  });
+
+  const last = helpers.getTokenUsage().last;
+  assert.equal(last.usage.inputTokens, 788977);
+  assert.equal(last.usage.outputTokens, 2670);
+  assert.equal(last.usage.totalTokens, 791647);
+  assert.equal(last.usage.cachedTokens, 596480);
+  assert.equal(last.callCount, 4);
+});
+
+test("user send starts a fresh turn on the next network request", () => {
+  const helpers = loadHelpers();
+  helpers.setActiveConversationId("thread-a");
+  helpers.rememberMetric({ usage: detailedUsage(105649), elapsedMs: 213000, source: "network" });
+
+  helpers.dispatchDocumentEvent("keydown", {
+    key: "Enter",
+    shiftKey: false,
+    target: { tagName: "TEXTAREA", ariaLabel: "", textContent: "next request" },
+  });
+  assert.equal(helpers.getDisplayMetric().usage.totalTokens, 105649);
+
+  helpers.markTurnStarted();
+  helpers.rememberMetric({ usage: detailedUsage(2450), elapsedMs: 15000, source: "network" });
+
+  const last = helpers.getTokenUsage().last;
+  assert.equal(last.usage.totalTokens, 2450);
+  assert.equal(last.callCount, 1);
+});
+
 test("rememberMetric deduplicates the same model call across observers", () => {
   const helpers = loadHelpers();
   const usage = {
@@ -369,6 +743,7 @@ test("rememberMetric deduplicates the same model call across observers", () => {
   assert.equal(last.usage.totalTokens, 1320);
   assert.equal(last.callCount, 1);
   assert.equal(last.elapsedMs, 11000);
+  assert.equal(helpers.formatBadgeText(last), "总计 1,320 · 输入 1,200 · 输出 120 · 缓存命中 900 · 缓存命中率 75.0% · 调用 1 次 · 耗时 11.0s");
 });
 
 test("rememberMetric applies context-only update to aggregated turn without adding a call", () => {
@@ -445,6 +820,20 @@ test("running status is scoped to the active conversation", () => {
 
   helpers.setActiveConversationId("thread-b");
   assert.equal(helpers.getDisplayMetric(), null);
+});
+
+test("completed conversation metric is not hidden by an empty running turn", () => {
+  const helpers = loadHelpers();
+
+  helpers.setActiveConversationId("thread-a");
+  helpers.rememberMetric({ usage: detailedUsage(105649), elapsedMs: 213000, source: "network" });
+  helpers.advanceTime(121000);
+  helpers.markTurnStarted();
+
+  const metric = helpers.getDisplayMetric();
+  assert.equal(metric.status, undefined);
+  assert.equal(metric.usage.totalTokens, 105649);
+  assert.equal(metric.callCount, 1);
 });
 
 test("typing or pressing enter does not show running before an API request", () => {
