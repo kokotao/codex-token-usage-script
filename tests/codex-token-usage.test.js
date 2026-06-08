@@ -4,7 +4,7 @@ const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
 
-function loadHelpers() {
+function loadHelpers(overrides = {}) {
   const source = fs.readFileSync(
     path.join(__dirname, "..", "scripts", "codex-token-usage.js"),
     "utf8",
@@ -66,6 +66,10 @@ function loadHelpers() {
       location: { href: "https://chatgpt.com/codex" },
       performance: { now: () => currentNow },
       sessionStorage,
+      queueMicrotask(fn) {
+        Promise.resolve().then(fn);
+      },
+      ...overrides,
     },
   };
   sandbox.window.window = sandbox.window;
@@ -171,11 +175,16 @@ test("extractUsage finds Responses API usage from JSON", () => {
 
   assert.deepEqual(JSON.parse(JSON.stringify(usage)), {
     inputTokens: 1200,
+    inputTotalTokens: 1200,
     outputTokens: 345,
+    outputTotalTokens: 345,
     totalTokens: 1545,
+    requestTotalTokens: 1545,
     cachedTokens: 800,
+    cachedReadTokens: 800,
     cacheReadTokens: 0,
     cacheCreationTokens: 0,
+    totalEstimated: false,
     hasBreakdown: true,
     contextUsed: 1545,
     contextLimit: 0,
@@ -189,11 +198,11 @@ test("script exposes version and reinstalls over older injected version", () => 
     __codexTokenUsageMessageObserver: "0.1.3",
   });
 
-  assert.equal(win.__codexTokenUsageVersion, "0.1.5");
-  assert.equal(win.__codexTokenUsageMessageObserver, "0.1.5");
+  assert.equal(win.__codexTokenUsageVersion, "0.1.6");
+  assert.equal(win.__codexTokenUsageMessageObserver, "0.1.6");
   assert.equal(Array.isArray(win.__codexTokenUsageDebug), true);
   assert.equal(win.__codexTokenUsageDebug.length, 0);
-  assert.equal(win.__codexTokenUsage.version, "0.1.5");
+  assert.equal(win.__codexTokenUsage.version, "0.1.6");
   assert.equal(typeof win.__codexTokenUsageScriptTest?.processPayload, "function");
 });
 
@@ -494,7 +503,26 @@ test("formatBadgeText includes tokens, cache, and seconds", () => {
     elapsedMs: 12345,
   });
 
-  assert.equal(text, "总计 1,250 · 输入 1,000 · 输出 250 · 缓存命中 600 · 缓存命中率 60.0% · 耗时 12.3s");
+  assert.equal(text, "本轮调用合计 1,250 · 输入 1,000 · 输出 250 · 缓存读 600 · 缓存命中率 60.0% · 耗时 12.3s");
+});
+
+test("formatBadgeText formats elapsed time as seconds minutes or hours", () => {
+  const helpers = loadHelpers();
+  const baseMetric = {
+    usage: {
+      inputTokens: 1000,
+      outputTokens: 250,
+      totalTokens: 1250,
+      cachedTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      hasBreakdown: true,
+    },
+  };
+
+  assert.match(helpers.formatBadgeText({ ...baseMetric, elapsedMs: 59900 }), /耗时 59\.9s$/);
+  assert.match(helpers.formatBadgeText({ ...baseMetric, elapsedMs: 65000 }), /耗时 1\.1min$/);
+  assert.match(helpers.formatBadgeText({ ...baseMetric, elapsedMs: 3900000 }), /耗时 1\.1h$/);
 });
 
 test("formatBadgeText labels unknown breakdown from fallback", () => {
@@ -514,7 +542,7 @@ test("formatBadgeText labels unknown breakdown from fallback", () => {
     elapsedMs: 0,
   });
 
-  assert.equal(text, "总计 46,205 · 输入 - · 输出 - · 上下文 46,205/258,400 (17.9%) · 耗时 -");
+  assert.equal(text, "本轮调用合计 46,205 · 输入 - · 输出 - · 上下文 46,205/258,400 (17.9%) · 耗时 -");
 });
 
 test("mergeMetric keeps detailed usage when context-only update arrives later", () => {
@@ -600,7 +628,7 @@ test("rememberMetric keeps detailed usage after context-only update", () => {
   assert.equal(last.usage.outputTokens, 495);
   assert.equal(last.usage.cachedTokens, 125824);
   assert.equal(last.usage.contextLimit, 258400);
-  assert.equal(helpers.formatBadgeText(last), "总计 127,552 · 输入 127,057 · 输出 495 · 缓存命中 125,824 · 缓存命中率 99.0% · 上下文 127,552/258,400 (49.4%) · 调用 1 次 · 耗时 42.0s");
+  assert.equal(helpers.formatBadgeText(last), "本轮调用合计 127,552 · 输入 127,057 · 输出 495 · 缓存读 125,824 · 缓存命中率 99.0% · 上下文 127,552/258,400 (49.4%) · 调用 1 次 · 耗时 42.0s");
 });
 
 test("rememberMetric aggregates multiple model calls in one Codex turn", () => {
@@ -645,7 +673,7 @@ test("rememberMetric aggregates multiple model calls in one Codex turn", () => {
   assert.equal(last.usage.totalTokens, 3350);
   assert.equal(last.usage.cachedTokens, 1800);
   assert.equal(last.callCount, 2);
-  assert.equal(helpers.formatBadgeText(last), "总计 3,350 · 输入 3,000 · 输出 350 · 缓存命中 1,800 · 缓存命中率 60.0% · 调用 2 次 · 耗时 24.0s");
+  assert.equal(helpers.formatBadgeText(last), "本轮调用合计 3,350 · 输入 3,000 · 输出 350 · 缓存读 1,800 · 缓存命中率 60.0% · 调用 2 次 · 耗时 24.0s");
 });
 
 test("rememberMetric keeps long-running assistant calls in the same turn", () => {
@@ -700,6 +728,100 @@ test("rememberMetric aggregates cached post-message usage entries for one reply"
   assert.equal(last.callCount, 4);
 });
 
+test("transient empty conversation id does not split an active turn", () => {
+  const helpers = loadHelpers();
+  helpers.setActiveConversationId("local:019e8762-c921-7ed3-a343-e705e10e9dab");
+
+  helpers.rememberMetric({
+    elapsedMs: 12000,
+    source: "post-message",
+    conversationId: "local:019e8762-c921-7ed3-a343-e705e10e9dab",
+    usage: {
+      inputTokens: 24390,
+      outputTokens: 352,
+      totalTokens: 24742,
+      cachedTokens: 23424,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      hasBreakdown: true,
+      contextUsed: 24742,
+      contextLimit: 258400,
+    },
+  });
+
+  helpers.setActiveConversationId("");
+
+  helpers.rememberMetric({
+    elapsedMs: 32000,
+    source: "post-message",
+    conversationId: "local:019e8762-c921-7ed3-a343-e705e10e9dab",
+    usage: {
+      inputTokens: 26171,
+      outputTokens: 364,
+      totalTokens: 26535,
+      cachedTokens: 23936,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      hasBreakdown: true,
+      contextUsed: 26535,
+      contextLimit: 258400,
+    },
+  });
+
+  const last = helpers.getTokenUsage().last;
+  assert.equal(last.usage.inputTokens, 50561);
+  assert.equal(last.usage.outputTokens, 716);
+  assert.equal(last.usage.totalTokens, 51277);
+  assert.equal(last.callCount, 2);
+});
+
+test("project id becoming available does not split an active turn", () => {
+  const helpers = loadHelpers();
+  helpers.setActiveConversationId("thread-a");
+
+  helpers.rememberMetric({
+    elapsedMs: 12000,
+    source: "post-message",
+    conversationId: "thread-a",
+    usage: {
+      inputTokens: 24390,
+      outputTokens: 352,
+      totalTokens: 24742,
+      cachedTokens: 23424,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      hasBreakdown: true,
+      contextUsed: 24742,
+      contextLimit: 258400,
+    },
+  });
+
+  helpers.setActiveProjectId("project-a");
+
+  helpers.rememberMetric({
+    elapsedMs: 32000,
+    source: "post-message",
+    conversationId: "thread-a",
+    usage: {
+      inputTokens: 26171,
+      outputTokens: 364,
+      totalTokens: 26535,
+      cachedTokens: 23936,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      hasBreakdown: true,
+      contextUsed: 26535,
+      contextLimit: 258400,
+    },
+  });
+
+  const last = helpers.getTokenUsage().last;
+  assert.equal(last.usage.inputTokens, 50561);
+  assert.equal(last.usage.outputTokens, 716);
+  assert.equal(last.usage.totalTokens, 51277);
+  assert.equal(last.callCount, 2);
+});
+
 test("user send starts a fresh turn on the next network request", () => {
   const helpers = loadHelpers();
   helpers.setActiveConversationId("thread-a");
@@ -743,7 +865,264 @@ test("rememberMetric deduplicates the same model call across observers", () => {
   assert.equal(last.usage.totalTokens, 1320);
   assert.equal(last.callCount, 1);
   assert.equal(last.elapsedMs, 11000);
-  assert.equal(helpers.formatBadgeText(last), "总计 1,320 · 输入 1,200 · 输出 120 · 缓存命中 900 · 缓存命中率 75.0% · 调用 1 次 · 耗时 11.0s");
+  assert.equal(helpers.formatBadgeText(last), "本轮调用合计 1,320 · 输入 1,200 · 输出 120 · 缓存读 900 · 缓存命中率 75.0% · 调用 1 次 · 耗时 11.0s");
+});
+
+test("formatBadgeText labels estimated total and split request/context metrics", () => {
+  const helpers = loadHelpers();
+  const usage = helpers.normalizeUsage({
+    input_tokens: 1200,
+    output_tokens: 120,
+    cached_input_tokens: 900,
+    contextLimit: 258400,
+  });
+
+  const text = helpers.formatBadgeText({
+    usage,
+    callCount: 1,
+    elapsedMs: 11000,
+  });
+
+  assert.equal(usage.totalEstimated, true);
+  assert.equal(usage.requestTotalTokens, 1320);
+  assert.equal(usage.inputTotalTokens, 1200);
+  assert.equal(usage.outputTotalTokens, 120);
+  assert.equal(text, "本轮调用合计 1,320(估算) · 输入 1,200 · 输出 120 · 缓存读 900 · 缓存命中率 75.0% · 上下文 1,320/258,400 (0.5%) · 调用 1 次 · 耗时 11.0s");
+});
+
+test("identical token counts from separate calls are not deduplicated without matching identity", () => {
+  const helpers = loadHelpers();
+  helpers.setActiveConversationId("thread-a");
+  const usage = detailedUsage(1320);
+
+  helpers.rememberMetric({ usage, elapsedMs: 9000, source: "network", conversationId: "thread-a" });
+  helpers.advanceTime(1500);
+  helpers.rememberMetric({ usage: { ...usage }, elapsedMs: 11000, source: "network", conversationId: "thread-a" });
+
+  const last = helpers.getTokenUsage().last;
+  assert.equal(last.callCount, 2);
+  assert.equal(last.usage.totalTokens, 2640);
+});
+
+test("context-only update from another conversation does not merge into last metric", () => {
+  const helpers = loadHelpers();
+
+  helpers.setActiveConversationId("thread-a");
+  helpers.rememberMetric({ usage: detailedUsage(1320), elapsedMs: 11000, source: "network", conversationId: "thread-a" });
+  helpers.setActiveConversationId("thread-b");
+  helpers.rememberMetric({
+    usage: {
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 5000,
+      cachedTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      hasBreakdown: false,
+      contextUsed: 5000,
+      contextLimit: 258400,
+    },
+    elapsedMs: 12000,
+    source: "context-meter",
+    conversationId: "thread-b",
+  });
+
+  helpers.setActiveConversationId("thread-a");
+  const metric = helpers.getDisplayMetric();
+  assert.equal(metric.usage.totalTokens, 1320);
+  assert.equal(metric.usage.contextLimit, 0);
+});
+
+test("export returns scoped calls and stored details", () => {
+  const helpers = loadHelpers();
+
+  helpers.setActiveProjectId("project-a");
+  helpers.setActiveConversationId("thread-a");
+  helpers.rememberMetric({ usage: detailedUsage(1320), elapsedMs: 11000, source: "network" });
+
+  const snapshot = helpers.exportUsage();
+  assert.equal(snapshot.version, "0.1.6");
+  assert.equal(snapshot.activeProjectId, "project-a");
+  assert.equal(snapshot.activeConversationId, "thread-a");
+  assert.equal(snapshot.calls.length, 1);
+  assert.equal(snapshot.calls[0].usage.totalTokens, 1320);
+  assert.equal(Array.isArray(snapshot.storedDetails), true);
+});
+
+test("export includes recent ledger event summaries", () => {
+  const helpers = loadHelpers();
+
+  helpers.setActiveProjectId("project-a");
+  helpers.setActiveConversationId("thread-a");
+  helpers.rememberMetric({ usage: detailedUsage(1320), elapsedMs: 11000, source: "network" });
+
+  const snapshot = helpers.exportUsage();
+  assert.equal(Array.isArray(snapshot.ledgerEvents), true);
+  assert.equal(snapshot.ledgerEvents.length, 1);
+  assert.equal(snapshot.ledgerEvents[0].kind, "usage");
+  assert.equal(snapshot.ledgerEvents[0].source, "network");
+  assert.equal(snapshot.ledgerEvents[0].rawSummary.totalTokens, 1320);
+});
+
+test("display metric can be rebuilt from ledger when derived caches are cleared", () => {
+  const helpers = loadHelpers();
+
+  helpers.setActiveProjectId("project-a");
+  helpers.setActiveConversationId("thread-a");
+  helpers.rememberMetric({
+    usage: {
+      inputTokens: 1000,
+      outputTokens: 100,
+      totalTokens: 1100,
+      cachedTokens: 600,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      hasBreakdown: true,
+      contextUsed: 1100,
+      contextLimit: 0,
+    },
+    elapsedMs: 10000,
+    source: "post-message",
+    conversationId: "thread-a",
+    projectId: "project-a",
+  });
+  helpers.rememberMetric({
+    usage: {
+      inputTokens: 2000,
+      outputTokens: 250,
+      totalTokens: 2250,
+      cachedTokens: 1200,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      hasBreakdown: true,
+      contextUsed: 2250,
+      contextLimit: 258400,
+    },
+    elapsedMs: 24000,
+    source: "websocket",
+    conversationId: "thread-a",
+    projectId: "project-a",
+  });
+
+  helpers.resetDerivedStatePreservingLedger();
+
+  const metric = helpers.getDisplayMetric();
+  assert.equal(metric.usage.inputTokens, 3000);
+  assert.equal(metric.usage.outputTokens, 350);
+  assert.equal(metric.usage.totalTokens, 3350);
+  assert.equal(metric.callCount, 2);
+});
+
+test("history restore rebuilds latest turn from bridge when cache is empty", async () => {
+  const helpers = loadHelpers({
+    __codexSessionDeleteBridge: async (path, payload) => {
+      assert.equal(path, "/thread-usage-history");
+      assert.equal(payload.session_id, "thread-a");
+      return {
+        status: "ok",
+        session_id: "thread-a",
+        history: [
+          {
+            source: "rollout-history",
+            conversation_id: "thread-a",
+            turn_id: "turn-1",
+            observed_at: "2026-06-02T05:00:00Z",
+            usage: {
+              inputTokens: 1000,
+              outputTokens: 100,
+              totalTokens: 1100,
+              cachedTokens: 600,
+              contextUsed: 1100,
+              contextLimit: 258400,
+              hasBreakdown: true,
+            },
+          },
+          {
+            source: "rollout-history",
+            conversation_id: "thread-a",
+            turn_id: "turn-1",
+            observed_at: "2026-06-02T05:00:02Z",
+            usage: {
+              inputTokens: 1200,
+              outputTokens: 120,
+              totalTokens: 1320,
+              cachedTokens: 900,
+              contextUsed: 1320,
+              contextLimit: 258400,
+              hasBreakdown: true,
+            },
+          },
+          {
+            source: "rollout-history",
+            conversation_id: "thread-a",
+            turn_id: "turn-2",
+            observed_at: "2026-06-02T05:01:00Z",
+            usage: {
+              inputTokens: 2000,
+              outputTokens: 250,
+              totalTokens: 2250,
+              cachedTokens: 1200,
+              contextUsed: 2250,
+              contextLimit: 258400,
+              hasBreakdown: true,
+            },
+          },
+        ],
+      };
+    },
+  });
+
+  helpers.setActiveConversationId("thread-a");
+  await helpers.restoreHistoryForConversation("thread-a", { force: true });
+
+  const metric = helpers.getDisplayMetric();
+  assert.equal(metric.usage.totalTokens, 2250);
+  assert.equal(metric.callCount, 1);
+
+  const turns = helpers.getTurnsForActiveConversation();
+  assert.equal(turns.length, 2);
+  assert.equal(turns[0].usage.totalTokens, 2420);
+  assert.equal(turns[0].callCount, 2);
+  assert.equal(turns[1].usage.totalTokens, 2250);
+});
+
+test("history restore does not crash when bridge has no history", async () => {
+  const helpers = loadHelpers({
+    __codexSessionDeleteBridge: async () => ({
+      status: "failed",
+      message: "not found",
+      history: [],
+    }),
+  });
+
+  helpers.setActiveConversationId("thread-a");
+  const restored = await helpers.restoreHistoryForConversation("thread-a", { force: true });
+
+  assert.equal(restored, null);
+  assert.equal(helpers.getDisplayMetric(), null);
+});
+
+test("turn history can be rebuilt from ledger when derived caches are cleared", () => {
+  const helpers = loadHelpers();
+
+  helpers.setActiveProjectId("project-a");
+  helpers.setActiveConversationId("thread-a");
+  helpers.rememberMetric({ usage: detailedUsage(1320), elapsedMs: 11000, source: "network", conversationId: "thread-a", projectId: "project-a" });
+
+  helpers.dispatchDocumentEvent("keydown", {
+    key: "Enter",
+    shiftKey: false,
+    target: { tagName: "TEXTAREA", ariaLabel: "", textContent: "next" },
+  });
+  helpers.markTurnStarted();
+  helpers.rememberMetric({ usage: detailedUsage(2450), elapsedMs: 15000, source: "network", conversationId: "thread-a", projectId: "project-a" });
+
+  helpers.resetDerivedStatePreservingLedger();
+
+  const turns = helpers.getTurnsForActiveConversation();
+  assert.equal(turns.length, 2);
+  assert.equal(turns[0].usage.totalTokens, 1320);
+  assert.equal(turns[1].usage.totalTokens, 2450);
 });
 
 test("rememberMetric applies context-only update to aggregated turn without adding a call", () => {
@@ -871,6 +1250,51 @@ test("conversation switch restores cached metric for that conversation", () => {
   assert.equal(helpers.getDisplayMetric().usage.totalTokens, 2450);
   helpers.setActiveConversationId("thread-a");
   assert.equal(helpers.getDisplayMetric().usage.totalTokens, 1320);
+});
+
+test("same conversation id is isolated across projects", () => {
+  const helpers = loadHelpers();
+
+  helpers.setActiveProjectId("project-a");
+  helpers.setActiveConversationId("thread-a");
+  helpers.rememberMetric({ usage: detailedUsage(1320), elapsedMs: 11000, source: "network" });
+
+  helpers.setActiveProjectId("project-b");
+  helpers.setActiveConversationId("thread-a");
+  assert.equal(helpers.getDisplayMetric(), null);
+
+  helpers.rememberMetric({ usage: detailedUsage(2450), elapsedMs: 15000, source: "network" });
+  assert.equal(helpers.getDisplayMetric().usage.totalTokens, 2450);
+
+  helpers.setActiveProjectId("project-a");
+  helpers.setActiveConversationId("thread-a");
+  assert.equal(helpers.getDisplayMetric().usage.totalTokens, 1320);
+});
+
+test("same conversation keeps turns isolated while displaying the latest turn", () => {
+  const helpers = loadHelpers();
+
+  helpers.setActiveProjectId("project-a");
+  helpers.setActiveConversationId("thread-a");
+  helpers.rememberMetric({ usage: detailedUsage(1320), elapsedMs: 11000, source: "network" });
+  const firstTurn = helpers.getDisplayMetric();
+
+  helpers.dispatchDocumentEvent("keydown", {
+    key: "Enter",
+    shiftKey: false,
+    target: { tagName: "TEXTAREA", ariaLabel: "", textContent: "next" },
+  });
+  helpers.markTurnStarted();
+  helpers.rememberMetric({ usage: detailedUsage(2450), elapsedMs: 15000, source: "network" });
+
+  const latest = helpers.getDisplayMetric();
+  assert.equal(latest.usage.totalTokens, 2450);
+  assert.notEqual(latest.turnId, firstTurn.turnId);
+
+  const turns = helpers.getTurnsForActiveConversation();
+  assert.equal(turns.length, 2);
+  assert.equal(turns[0].usage.totalTokens, 1320);
+  assert.equal(turns[1].usage.totalTokens, 2450);
 });
 
 test("parseElapsedMs reads Codex processed duration text", () => {
