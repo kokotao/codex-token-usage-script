@@ -2,7 +2,7 @@
   "use strict";
 
   const SCRIPT_ID = "codex-token-usage";
-  const SCRIPT_VERSION = "0.1.6";
+  const SCRIPT_VERSION = "0.1.7";
   const BADGE_CLASS = "codex-token-usage-badge";
   const STYLE_ID = "codex-token-usage-style";
   const RECENT_LIMIT = 20;
@@ -88,6 +88,9 @@
     const cacheReadTokens = normalizeNumber(raw.cache_read_input_tokens ?? raw.cacheReadInputTokens);
     const cacheCreationTokens = normalizeNumber(raw.cache_creation_input_tokens ?? raw.cacheCreationInputTokens);
     const cachedReadTokens = cacheReadTokens || cachedTokens;
+    const explicitInputTotal = normalizeNumber(
+      raw.input_total_tokens ?? raw.inputTotalTokens ?? raw.prompt_total_tokens ?? raw.promptTotalTokens,
+    );
     const contextUsed = normalizeNumber(raw.contextUsed ?? raw.context_used ?? raw.usedTokens ?? raw.used_tokens ?? raw.used);
     const contextLimit = normalizeNumber(
       raw.contextLimit ?? raw.context_limit ?? raw.modelContextWindow ?? raw.model_context_window ?? raw.contextWindow ?? raw.context_window ?? raw.limit,
@@ -103,9 +106,14 @@
     ) {
       return null;
     }
+    const inputFromTotal = totalTokens && outputTokens && totalTokens > outputTokens ? totalTokens - outputTokens : 0;
+    let inputTotalTokens = Math.max(explicitInputTotal, inputTokens, inputFromTotal);
+    if (cachedReadTokens > inputTotalTokens) {
+      inputTotalTokens += cachedReadTokens + cacheCreationTokens;
+    }
     return {
       inputTokens,
-      inputTotalTokens: inputTokens,
+      inputTotalTokens,
       outputTokens,
       outputTotalTokens: outputTokens,
       totalTokens,
@@ -623,11 +631,21 @@
   function metricForActiveConversation() {
     const active = currentConversationId();
     const activeScope = currentScopeKey();
+    let completedMetric = null;
+    if (activeScope) {
+      completedMetric = deriveLatestMetricFromLedger(activeScope, active) || state.byScope[activeScope] || null;
+    } else {
+      completedMetric =
+        deriveLatestMetricFromLedger("", active)
+        || (active && state.byConversation[active])
+        || (conversationMatchesActive(state.lastMetric) ? state.lastMetric : null);
+    }
     if (state.currentTurn && !state.currentTurn.calls.length && state.currentTurn.status === "running") {
       if (
         (!active || !state.currentTurn.conversationId || active === state.currentTurn.conversationId) &&
         (!activeScope || !state.currentTurn.scopeKey || activeScope === state.currentTurn.scopeKey)
       ) {
+        if (completedMetric?.callCount >= 1) return completedMetric;
         return {
           status: "running",
           projectId: state.currentTurn.projectId || currentProjectId(),
@@ -639,16 +657,7 @@
         };
       }
     }
-    if (activeScope) {
-      const derivedScoped = deriveLatestMetricFromLedger(activeScope, active);
-      if (derivedScoped) return derivedScoped;
-      if (state.byScope[activeScope]) return state.byScope[activeScope];
-      return null;
-    }
-    const derived = deriveLatestMetricFromLedger("", active);
-    if (derived) return derived;
-    if (active && state.byConversation[active]) return state.byConversation[active];
-    return conversationMatchesActive(state.lastMetric) ? state.lastMetric : null;
+    return completedMetric;
   }
 
   function setActiveProjectId(projectId) {
