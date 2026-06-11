@@ -198,11 +198,11 @@ test("script exposes version and reinstalls over older injected version", () => 
     __codexTokenUsageMessageObserver: "0.1.3",
   });
 
-  assert.equal(win.__codexTokenUsageVersion, "0.1.6");
-  assert.equal(win.__codexTokenUsageMessageObserver, "0.1.6");
+  assert.equal(win.__codexTokenUsageVersion, "0.1.7");
+  assert.equal(win.__codexTokenUsageMessageObserver, "0.1.7");
   assert.equal(Array.isArray(win.__codexTokenUsageDebug), true);
   assert.equal(win.__codexTokenUsageDebug.length, 0);
-  assert.equal(win.__codexTokenUsage.version, "0.1.6");
+  assert.equal(win.__codexTokenUsage.version, "0.1.7");
   assert.equal(typeof win.__codexTokenUsageScriptTest?.processPayload, "function");
 });
 
@@ -890,6 +890,26 @@ test("formatBadgeText labels estimated total and split request/context metrics",
   assert.equal(text, "本轮调用合计 1,320(估算) · 输入 1,200 · 输出 120 · 缓存读 900 · 缓存命中率 75.0% · 上下文 1,320/258,400 (0.5%) · 调用 1 次 · 耗时 11.0s");
 });
 
+test("formatBadgeText uses effective input total when cached input exceeds reported input", () => {
+  const helpers = loadHelpers();
+  const usage = helpers.normalizeUsage({
+    input_tokens: 1000,
+    cached_input_tokens: 8000,
+    output_tokens: 100,
+    total_tokens: 9100,
+  });
+
+  const text = helpers.formatBadgeText({
+    usage,
+    callCount: 1,
+    elapsedMs: 11000,
+  });
+
+  assert.equal(usage.inputTokens, 1000);
+  assert.equal(usage.inputTotalTokens, 9000);
+  assert.equal(text, "本轮调用合计 9,100 · 输入 9,000 · 输出 100 · 缓存读 8,000 · 缓存命中率 88.9% · 调用 1 次 · 耗时 11.0s");
+});
+
 test("identical token counts from separate calls are not deduplicated without matching identity", () => {
   const helpers = loadHelpers();
   helpers.setActiveConversationId("thread-a");
@@ -941,7 +961,7 @@ test("export returns scoped calls and stored details", () => {
   helpers.rememberMetric({ usage: detailedUsage(1320), elapsedMs: 11000, source: "network" });
 
   const snapshot = helpers.exportUsage();
-  assert.equal(snapshot.version, "0.1.6");
+  assert.equal(snapshot.version, "0.1.7");
   assert.equal(snapshot.activeProjectId, "project-a");
   assert.equal(snapshot.activeConversationId, "thread-a");
   assert.equal(snapshot.calls.length, 1);
@@ -1212,6 +1232,25 @@ test("completed conversation metric is not hidden by an empty running turn", () 
   const metric = helpers.getDisplayMetric();
   assert.equal(metric.status, undefined);
   assert.equal(metric.usage.totalTokens, 105649);
+  assert.equal(metric.callCount, 1);
+});
+
+test("completed metric stays visible when next turn has only an empty running state", () => {
+  const helpers = loadHelpers();
+
+  helpers.setActiveConversationId("thread-a");
+  helpers.rememberMetric({ usage: detailedUsage(1320), elapsedMs: 11000, source: "network" });
+
+  helpers.dispatchDocumentEvent("keydown", {
+    key: "Enter",
+    shiftKey: false,
+    target: { tagName: "TEXTAREA", ariaLabel: "", textContent: "next" },
+  });
+  helpers.markTurnStarted();
+
+  const metric = helpers.getDisplayMetric();
+  assert.equal(metric.status, undefined);
+  assert.equal(metric.usage.totalTokens, 1320);
   assert.equal(metric.callCount, 1);
 });
 
